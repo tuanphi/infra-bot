@@ -1,33 +1,22 @@
-FROM python:3.12-slim
+FROM python:3.8.10-slim-bullseye
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    ANSIBLE_HOST_KEY_CHECKING=True
 
 WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git openssh-client ca-certificates build-essential libffi-dev libssl-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /root/.ssh && chmod 700 /root/.ssh
 
-RUN apt-get update && apt-get install -y \
-    git \
-    ssh \
-    curl \
-    unzip \
-    vim \
-    tesseract-ocr \
-    tesseract-ocr-vie \
-    && \
-    # Install terraform
-    curl -Lo /tmp/terraform.zip https://releases.hashicorp.com/terraform/1.9.0/terraform_1.9.0_linux_amd64.zip \
-    && unzip /tmp/terraform.zip -d /usr/local/bin/ \
-    && rm /tmp/terraform.zip \
-    && \
-    # Install terragrunt
-    curl -Lo /usr/local/bin/terragrunt \
-       https://github.com/gruntwork-io/terragrunt/releases/download/v0.67.0/terragrunt_linux_amd64 \
-    && chmod +x /usr/local/bin/terragrunt \
-    && apt-get clean && rm -rf /var/lib/apt/lists/* \
-    && echo "alias ll='ls -alF'" >> /etc/bash.bashrc
+COPY requirements.txt ./
+RUN python -m pip install --no-cache-dir 'pip<25' \
+    && python -m pip install --no-cache-dir -r requirements.txt \
+    && python -c "import sys, jinja2; assert sys.version_info[:3] == (3, 8, 10); assert jinja2.__version__ == '2.10.1'" \
+    && ansible --version | grep -F 'ansible [core 2.12.10]'
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY config.py workflow.py bot.py ./
 
-COPY *.py ./
-
-ENV PYTHONUNBUFFERED=1
-
-CMD ["python", "main.py"]
+RUN chmod +x bin/run
+CMD ["python", "bot.py"]

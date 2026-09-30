@@ -1,0 +1,22 @@
+#!/usr/bin/env sh
+
+set -e
+
+log() {
+  msg=$1
+  echo "Start_script: ${msg}"
+}
+
+keysMountedPath="/mnt/secrets"
+envConfigFile=".env"
+
+if [ -f ${keysMountedPath}/${envConfigFile} ]; then
+  log "Found environment configuration."
+  ln -s ${keysMountedPath}/${envConfigFile} ${envConfigFile}
+  log "Linked ${keysMountedPath}/${envConfigFile} -> ${envConfigFile}"
+else
+  log "Not found environment configuration."
+  log "Application will be started with default configuration."
+fi
+
+exec python bot.py
