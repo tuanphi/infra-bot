@@ -16,7 +16,7 @@ from urllib.error import URLError
 from config import Settings
 
 
-PLAYBOOK = "sftp-server.yaml"
+PLAYBOOK = "gitlab-repos.yaml"
 INVENTORY = "nonprod"
 TAG = "project_user_access"
 BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,100}$")
@@ -111,7 +111,7 @@ class GitLabClient:
 
             description = (
                 "Ansible execution passed before opening this MR.\n\n"
-                "Command: `ansible-playbook -i nonprod sftp-server.yaml --tags=project_user_access`\n"
+                "Command: `ansible-playbook -i nonprod gitlab-repos.yaml --tags=project_user_access`\n"
                 "Commit tested: `%s`\nRequested by Telegram user ID: `%s`\n"
                 "Completed (UTC): %s\n\n```\n%s\n```"
                 % (commit, requester, datetime.now(timezone.utc).isoformat(), recap)
@@ -121,7 +121,7 @@ class GitLabClient:
                 payload={
                     "source_branch": branch,
                     "target_branch": self.settings.git_target_branch,
-                    "title": "SFTP project_user_access: %s" % branch,
+                    "title": "GitLab project_user_access: %s" % branch,
                     "description": description,
                     "remove_source_branch": True,
                 },
@@ -173,7 +173,7 @@ class Pipeline:
 
             _git(repo, "switch", "--detach", commit)
             if not (repo / INVENTORY).is_file() or not (repo / PLAYBOOK).is_file():
-                raise WorkflowError("Branch thiếu file nonprod hoặc sftp-server.yaml ở thư mục gốc.")
+                raise WorkflowError("Branch thiếu file nonprod hoặc gitlab-repos.yaml ở thư mục gốc.")
 
             # The fixed argv is intentionally identical to the requested command.
             ansible_args = [

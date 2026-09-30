@@ -1,4 +1,4 @@
-"""A minimal Telegram interface for the SFTP Ansible workflow."""
+"""A minimal Telegram interface for the Gitlab Ansible workflow."""
 
 import asyncio
 from functools import partial
@@ -31,7 +31,7 @@ def build_application(settings):
     async def help_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if await authorized(update):
             await update.effective_message.reply_text(
-                "Dùng /run <source-branch> để chạy playbook SFTP trên branch đã commit "
+                "Dùng /run <source-branch> để chạy playbook GitLab trên branch đã commit "
                 "và tạo GitLab MR nếu Ansible thành công."
             )
 

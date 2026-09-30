@@ -38,17 +38,17 @@ class WorkflowTests(unittest.TestCase):
         git("init", "-b", "master", str(self.local))
         git("config", "user.name", "Bot Test", cwd=self.local)
         git("config", "user.email", "bot@example.org", cwd=self.local)
-        (self.local / "nonprod").write_text("[sftp-server]\nlocalhost ansible_connection=local\n")
-        (self.local / "sftp-server.yaml").write_text("---\n- hosts: sftp-server\n  tasks: []\n")
+        (self.local / "nonprod").write_text("[gitlab]\nlocalhost ansible_connection=local\n")
+        (self.local / "gitlab-repos.yaml").write_text("---\n- hosts: gitlab\n  tasks: []\n")
         git("add", ".", cwd=self.local)
         git("commit", "-m", "base", cwd=self.local)
         git("remote", "add", "origin", str(self.remote), cwd=self.local)
         git("push", "-u", "origin", "master", cwd=self.local)
-        git("switch", "-c", "feature/sftp-user", cwd=self.local)
+        git("switch", "-c", "feature/gitlab-user", cwd=self.local)
         (self.local / "project-user.txt").write_text("user configuration\n")
         git("add", ".", cwd=self.local)
-        git("commit", "-m", "add sftp user", cwd=self.local)
-        git("push", "-u", "origin", "feature/sftp-user", cwd=self.local)
+        git("commit", "-m", "add gitlab user", cwd=self.local)
+        git("push", "-u", "origin", "feature/gitlab-user", cwd=self.local)
 
         self.marker = root / "invocation.json"
         self.executable = root / "fake-ansible"
@@ -58,7 +58,7 @@ class WorkflowTests(unittest.TestCase):
             "with open(os.environ['ANSIBLE_TEST_MARKER'], 'w') as out:\n"
             "    json.dump({'args': sys.argv[1:], 'cwd': os.getcwd()}, out)\n"
             "print('PLAY RECAP ' + '*' * 50)\n"
-            "print('sftp-server : ok=1 changed=1 unreachable=0 failed=0')\n"
+            "print('gitlab : ok=1 changed=1 unreachable=0 failed=0')\n"
             "sys.exit(int(os.getenv('ANSIBLE_TEST_EXIT', '0')))\n"
         )
         self.executable.chmod(0o755)
@@ -76,11 +76,11 @@ class WorkflowTests(unittest.TestCase):
         self.pipeline = Pipeline(settings, mr_client=self.mr)
 
     def test_success_runs_exact_command_from_branch_then_creates_mr(self):
-        result = self.pipeline.run("feature/sftp-user", 42)
+        result = self.pipeline.run("feature/gitlab-user", 42)
         invocation = json.loads(self.marker.read_text())
         self.assertEqual(
             invocation["args"],
-            ["-i", "nonprod", "sftp-server.yaml", "--tags=project_user_access"],
+            ["-i", "nonprod", "gitlab-repos.yaml", "--tags=project_user_access"],
         )
         self.assertTrue(invocation["cwd"].endswith("/infra"))
         self.assertEqual(result.commit, git("rev-parse", "HEAD", cwd=self.local))
@@ -90,7 +90,7 @@ class WorkflowTests(unittest.TestCase):
     def test_failed_ansible_does_not_create_mr(self):
         with patch.dict(os.environ, {"ANSIBLE_TEST_EXIT": "2"}):
             with self.assertRaisesRegex(WorkflowError, "Ansible thất bại"):
-                self.pipeline.run("feature/sftp-user", 42)
+                self.pipeline.run("feature/gitlab-user", 42)
         self.assertEqual(self.mr.calls, [])
 
     def test_branch_without_diff_does_not_run_ansible_or_create_mr(self):
@@ -117,11 +117,11 @@ class WorkflowTests(unittest.TestCase):
             return io.BytesIO(b'{"web_url":"https://gitlab.example/mr/123"}')
 
         client = GitLabClient(self.pipeline.settings, opener=opener)
-        url = client.create_or_get_mr("feature/sftp-user", "abc123", 42, "PLAY RECAP: ok")
+        url = client.create_or_get_mr("feature/gitlab-user", "abc123", 42, "PLAY RECAP: ok")
         self.assertEqual(url, "https://gitlab.example/mr/123")
         self.assertIn("devops%2Fansible%2Finfra", requests_seen[0].full_url)
         payload = json.loads(requests_seen[1].data)
-        self.assertEqual(payload["source_branch"], "feature/sftp-user")
+        self.assertEqual(payload["source_branch"], "feature/gitlab-user")
         self.assertEqual(payload["target_branch"], "master")
         self.assertIn("abc123", payload["description"])
 

@@ -1,11 +1,11 @@
-# SFTP Ansible Telegram bot
+# Ansible Telegram bot
 
 Bot này chạy đúng lệnh dưới đây từ thư mục gốc của source
 `gitlab.g-pay.vn/devops/ansible/infra`, sau đó tạo GitLab Merge Request khi
 Ansible thành công:
 
 ```bash
-ansible-playbook -i nonprod sftp-server.yaml --tags=project_user_access
+ansible-playbook -i nonprod gitlab-repos.yaml --tags=project_user_access
 ```
 
 Chỉ có `/run <source-branch>`, `/start` và `/help`. Không chứa OCR, VPN,
@@ -20,7 +20,7 @@ và các dependency role/collection tại môi trường của bạn.
 
 1. Người vận hành cập nhật cấu hình Ansible trên source branch và push.
 2. Thành viên có ID trong `ALLOWED_USER_IDS`, ở đúng `ALLOWED_GROUP_ID`, gửi
-   `/run feature/add-sftp-user`.
+   `/run feature/add-user`.
 3. Bot clone repo, fetch branch, kiểm tra diff, checkout **commit cố định**,
    kiểm tra file, chạy lệnh Ansible trên.
 4. Ansible exit 0 và branch vẫn trỏ cùng commit: bot dùng GitLab API tìm MR
@@ -50,8 +50,7 @@ docker run --rm --env-file .env \
 ```
 
 Tạo `.env` từ `.env.example`, điền token và ID thật; **không commit `.env` hoặc
-private key**. `known_hosts` phải chứa host key đã xác minh của GitLab và các
-SFTP server. Nếu GitLab dùng CA nội bộ, đưa CA vào trust store của container.
+private key**. `known_hosts` phải chứa host key đã xác minh của GitLab server. Nếu GitLab dùng CA nội bộ, đưa CA vào trust store của container.
 GitLab token cần quyền API tạo MR, Git SSH key cần đọc repo; Ansible SSH key
 cần kết nối đúng host nonprod. Nếu playbook dùng Ansible Vault, bổ sung secret
 và `ANSIBLE_VAULT_PASSWORD_FILE` vào runtime. Nếu repo khai báo roles/collections,
@@ -71,4 +70,4 @@ python -m unittest discover -s tests -v
 
 Test dùng repo Git local và executable Ansible giả để xác nhận đúng argv,
 chỉ tạo MR sau exit 0, và từ chối branch không có diff. Test không kết nối
-GitLab thật hay SFTP server thật.
+GitLab thật hay Ansible server thật.
