@@ -43,9 +43,8 @@ mirror/nâng cấp theo chính sách bảo mật riêng nếu đem dùng lâu d�
 ```bash
 docker build -t infra-ansible-bot:1.0 .
 docker run --rm --env-file .env \
-  -v /secure/path/git_id_ed25519:/run/secrets/git_id_ed25519:ro \
-  -v /secure/path/ansible_id_ed25519:/run/secrets/ansible_id_ed25519:ro \
-  -v /secure/path/known_hosts:/root/.ssh/known_hosts:ro \
+  -v /home/tuanpv/.ssh/id_ed25519:/run/secrets/git_id_ed25519:ro \
+  -v /home/tuanpv/.ssh/known_hosts:/root/.ssh/known_hosts:ro \
   infra-ansible-bot:1.0
 ```
 
