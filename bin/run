@@ -24,4 +24,5 @@ for key in ${keys}; do
   echo
 done
 
-exec dotenv -f $ENV_FILE run --no-override python3 /app/bot.py
+# exec dotenv -f $ENV_FILE run --no-override python3 /app/bot.py
+exec python3 /app/bot.py
