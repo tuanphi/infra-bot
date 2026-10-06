@@ -4,6 +4,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 def load_env_file(path="/mnt/secrets/.env", override=False):
@@ -59,6 +60,7 @@ class Settings:
     health_port: int = 8080
     git_clone_dir: str = "/app/infra"
     git_clone_timeout_seconds: int = 180
+    gitlab_username: str = ""
 
     @classmethod
     def from_env(cls):
@@ -67,6 +69,8 @@ class Settings:
             "GIT_REPO_URL", "GIT_TARGET_BRANCH", "GITLAB_URL",
             "GITLAB_PROJECT_ID", "GITLAB_TOKEN",
         )
+        if urlsplit(os.getenv("GIT_REPO_URL", "")).scheme == "https":
+            required += ("GITLAB_USERNAME",)
         missing = [name for name in required if not os.environ.get(name, "").strip()]
         if missing:
             raise ValueError("Missing configuration: " + ", ".join(missing))
@@ -98,6 +102,7 @@ class Settings:
             gitlab_url=os.environ["GITLAB_URL"].rstrip("/"),
             gitlab_project_id=os.environ["GITLAB_PROJECT_ID"],
             gitlab_token=os.environ["GITLAB_TOKEN"],
+            gitlab_username=os.getenv("GITLAB_USERNAME", "").strip(),
             ansible_timeout_seconds=timeout,
             ansible_binary=os.getenv("ANSIBLE_PLAYBOOK_BIN", "ansible-playbook"),
             health_port=health_port,

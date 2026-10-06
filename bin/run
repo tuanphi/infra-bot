@@ -17,7 +17,7 @@ for key in ${keys}; do
   fi
 
   echo "Found ${key} in ${keysMountedPath}"
-  ln -s ${keysMountedPath}/${key} ${key}
+  ln -sfn "${keysMountedPath}/${key}" "${key}"
   echo "Linked ${key} -> ${keysMountedPath}/${key}"
   echo
 done

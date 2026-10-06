@@ -14,7 +14,7 @@ from urllib.request import Request, urlopen
 from urllib.error import URLError
 
 from config import Settings
-from git_auth import git_environment
+from git_auth import authenticated_repo_url, git_environment, redact_git_output
 
 
 PLAYBOOK = "gitlab-repos.yaml"
@@ -63,10 +63,39 @@ def _command(args, cwd=None, timeout=120, env=None):
 
 def git_command(settings, args, cwd=None, timeout=120):
     try:
-        prefix, env = git_environment(settings.git_repo_url, settings.gitlab_token)
+        prefix, env = git_environment(
+            settings.git_repo_url, settings.gitlab_token, settings.gitlab_username,
+        )
     except ValueError as exc:
-        raise WorkflowError("Cấu hình Git HTTPS không hợp lệ: %s" % exc) from exc
-    return _command(prefix + list(args), cwd=cwd, timeout=timeout, env=env)
+        raise WorkflowError("Cấu hình Git HTTPS không hợp lệ: %s" % exc) from None
+    try:
+        return _command(prefix + list(args), cwd=cwd, timeout=timeout, env=env)
+    except WorkflowError as exc:
+        # TimeoutExpired contains argv, which may include the authenticated clone URL.
+        raise WorkflowError(redact_git_output(str(exc), settings.gitlab_token)) from None
+
+
+def clone_repository(settings, repo, description="repo Ansible"):
+    try:
+        url = authenticated_repo_url(
+            settings.git_repo_url, settings.gitlab_username, settings.gitlab_token,
+        )
+    except ValueError as exc:
+        raise WorkflowError("Cấu hình Git HTTPS không hợp lệ: %s" % exc) from None
+    try:
+        code, output = git_command(settings, [
+            "clone", "--no-tags", "--single-branch", "--branch",
+            settings.git_target_branch, "--", url, str(repo),
+        ], timeout=settings.git_clone_timeout_seconds)
+    finally:
+        # Git persists the clone URL. Remove credentials even on partial failure.
+        if (Path(repo) / ".git").is_dir():
+            _git(repo, "remote", "set-url", "origin", settings.git_repo_url, settings=settings)
+    if code:
+        detail = redact_git_output(output, settings.gitlab_token).strip()[-1200:]
+        raise WorkflowError("Không clone được %s (exit %s).\n%s" % (
+            description, code, detail or "Git không trả về chi tiết lỗi.",
+        ))
 
 
 def _git(repo, *args, settings=None, timeout=120):
@@ -75,8 +104,11 @@ def _git(repo, *args, settings=None, timeout=120):
     else:
         code, output = git_command(settings, ["-C", str(repo), *args], timeout=timeout)
     if code != 0:
-        # Git output may contain URLs with embedded credentials; do not relay it.
-        raise WorkflowError("Git thất bại ở bước %s (exit %s)." % (args[0], code))
+        token = settings.gitlab_token if settings else ""
+        detail = redact_git_output(output, token).strip()[-1200:]
+        raise WorkflowError("Git thất bại ở bước %s (exit %s).\n%s" % (
+            args[0], code, detail or "Git không trả về chi tiết lỗi.",
+        ))
     return output.strip()
 
 
@@ -162,12 +194,7 @@ class Pipeline:
 
         with tempfile.TemporaryDirectory(prefix="infra-ansible-bot-") as temp:
             repo = Path(temp) / "infra"
-            code, _ = git_command(self.settings, [
-                "clone", "--no-tags", "--single-branch", "--branch",
-                base_branch, "--", self.settings.git_repo_url, str(repo),
-            ], timeout=self.settings.git_clone_timeout_seconds)
-            if code:
-                raise WorkflowError("Không clone được repo Ansible (exit %s)." % code)
+            clone_repository(self.settings, repo)
 
             source_ref = "refs/remotes/origin/" + branch
             target_ref = "refs/remotes/origin/" + base_branch

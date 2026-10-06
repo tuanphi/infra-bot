@@ -40,7 +40,9 @@ và clone repo Ansible vào `/app/infra` trước khi mở HTTP health và Teleg
 Đặt các biến sau trong file `.env`:
 
 ```dotenv
-GIT_REPO_URL=https://gitlab.g-pay.vn/devops/ansible/infra.git
+GIT_REPO_URL=https://gitlab.g-pay.vn/devops/ansible/infra
+GITLAB_USERNAME=tuanpv
+GITLAB_TOKEN=replace-with-gitlab-token
 GIT_TARGET_BRANCH=master
 GIT_CLONE_DIR=/app/infra
 GIT_CLONE_TIMEOUT_SECONDS=180
@@ -48,12 +50,27 @@ HEALTH_PORT=8080
 ```
 
 `GIT_CLONE_DIR`, `GIT_CLONE_TIMEOUT_SECONDS` và `HEALTH_PORT` có các giá trị mặc
-định như ví dụ, nên không bắt buộc khai báo. `GITLAB_TOKEN` hiện có được dùng để
-xác thực HTTPS qua Git credential helper, dùng username `oauth2`. Token cần quyền
-đọc repo và quyền API tạo MR. Token không được nhúng trong URL, argv của Git hoặc
-`remote.origin.url`; helper chỉ trả credential cho đúng host và đường dẫn repo.
+định như ví dụ, nên không bắt buộc khai báo. `GITLAB_USERNAME` bắt buộc khi
+`GIT_REPO_URL` dùng HTTPS; `GITLAB_TOKEN` hiện có được dùng làm password.
+Bot dựng URL clone từ ba biến này, URL-encode username/token nếu có ký tự đặc biệt,
+và thực hiện lệnh tương ứng:
+
+```bash
+git clone --no-tags --single-branch --branch master -- \
+  "https://tuanpv:<GITLAB_TOKEN>@gitlab.g-pay.vn/devops/ansible/infra" /app/infra
+```
+
+`<GITLAB_TOKEN>` được thay bằng giá trị thật trong Python, không chạy qua shell.
+Sau khi clone, bot đặt lại `remote.origin.url` về URL không chứa credential.
+Các lệnh fetch/ls-remote dùng Git credential helper với cùng `GITLAB_USERNAME`
+và `GITLAB_TOKEN`; helper chỉ trả credential cho đúng host và đường dẫn repo.
+Token cần quyền đọc repo và quyền API tạo MR.
 Giữ xác minh TLS; CA nội bộ phải có trong trust store hoặc cấu hình Git bằng
 `GIT_SSL_CAINFO` trỏ đến file CA đã mount.
+
+Khi Git thất bại, thông báo chứa exit code và phần lỗi chi tiết của Git đã che
+token/credential. Exit 128 chưa đủ để xác định lỗi xác thực: log mới giúp phân
+biệt `Authentication failed`, lỗi certificate, DNS/network hoặc branch không tồn tại.
 
 Nếu checkout đã tồn tại, bot kiểm tra origin và working tree, fetch branch rồi
 checkout detached commit mới nhất của `origin/GIT_TARGET_BRANCH`. Nếu thư mục có
@@ -135,5 +152,6 @@ python -m unittest discover -s tests -v
 Test dùng repo Git local và executable Ansible giả để xác nhận đúng argv,
 chỉ tạo MR sau exit 0, và từ chối branch không có diff. Test startup kiểm tra
 clone/cập nhật checkout, giữ dữ liệu local, credential helper qua Git thật,
-HTTP 200/404 và thứ tự khởi động. Test không kết nối GitLab/Telegram thật hay
+clone/fetch qua HTTPS có Basic authentication trên server local, che token trong
+lỗi xác thực/timeout, lỗi CA và HTTP 200/404. Test không kết nối GitLab/Telegram thật hay
 Ansible server thật.

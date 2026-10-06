@@ -7,7 +7,7 @@ from threading import Thread
 from urllib.parse import urlsplit
 
 from git_auth import repository_identity
-from workflow import WorkflowError, _git, git_command, validate_branch
+from workflow import WorkflowError, _git, clone_repository, validate_branch
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -51,15 +51,7 @@ def prepare_repository(settings):
     if not (repo / ".git").exists():
         repo.parent.mkdir(parents=True, exist_ok=True)
         logging.info("Cloning Ansible repository into %s", repo)
-        code, _ = git_command(settings, [
-            "clone", "--no-tags", "--single-branch", "--branch",
-            settings.git_target_branch, "--", settings.git_repo_url, str(repo),
-        ], timeout=timeout)
-        if code:
-            raise WorkflowError(
-                "Không clone được repo Ansible lúc khởi động (exit %s); kiểm tra URL, quyền truy cập và CA GitLab."
-                % code
-            )
+        clone_repository(settings, repo, description="repo Ansible lúc khởi động")
     else:
         origin = _git(repo, "remote", "get-url", "origin", settings=settings)
         if repository_identity(origin) != repository_identity(settings.git_repo_url):
