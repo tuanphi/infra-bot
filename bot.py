@@ -7,7 +7,7 @@ import logging
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-from config import Settings
+from config import Settings, load_env_file
 from workflow import Pipeline, WorkflowError
 
 
@@ -72,4 +72,5 @@ def build_application(settings):
 
 
 if __name__ == "__main__":
+    load_env_file("/mnt/secrets/.env", override=False)
     build_application(Settings.from_env()).run_polling()

@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 
-set -e
+set -eu
 
 log() {
   msg=$1
@@ -17,12 +17,9 @@ for key in ${keys}; do
   fi
 
   echo "Found ${key} in ${keysMountedPath}"
-  if [ -f ${key} ]; then
-    ln -s ${keysMountedPath}/${key} ${key}
-    echo "Linked ${key} -> ${keysMountedPath}/${key}"
-  fi
+  ln -s ${keysMountedPath}/${key} ${key}
+  echo "Linked ${key} -> ${keysMountedPath}/${key}"
   echo
 done
 
-# exec dotenv -f $ENV_FILE run --no-override python3 /app/bot.py
 exec python3 /app/bot.py

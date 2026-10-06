@@ -41,16 +41,36 @@ MarkupSafe được pin vì Jinja cũ cần `soft_unicode`. Ảnh base cũ cần
 mirror/nâng cấp theo chính sách bảo mật riêng nếu đem dùng lâu dài.
 
 ```bash
-docker build -t infra-ansible-bot:1.0 .
-docker run --rm --env-file .env \
-  -v /home/tuanpv/.ssh/id_ed25519:/run/secrets/git_id_ed25519:ro \
-  -v /home/tuanpv/.ssh/known_hosts:/root/.ssh/known_hosts:ro \
-  -v /home/tuanpv/g-pay/zerotrust-alert/.env:/mnt/secrets/.env \
-  infra-ansible-bot:v1.2
+docker build -t infra-ansible-bot:python-env .
+docker run --rm --name infra-bot \
+  -v /home/tuanpv/.ssh/id_ed25519:/mnt/secrets/git_private.pem:ro \
+  -v /home/tuanpv/.ssh/known_hosts:/mnt/secrets/known_hosts:ro \
+  -v /home/tuanpv/g-pay/zerotrust-alert/.env:/mnt/secrets/.env:ro \
+  infra-ansible-bot:python-env
 ```
 
 Tạo `.env` từ `.env.example`, điền token và ID thật; **không commit `.env` hoặc
 private key**. `known_hosts` phải chứa host key đã xác minh của GitLab server. Nếu GitLab dùng CA nội bộ, đưa CA vào trust store của container.
+
+Bot dùng `load_env_file()` trong `config.py` để đọc `/mnt/secrets/.env` trước
+`Settings.from_env()`. Hàm chỉ dùng thư viện chuẩn Python (`os`, `re`, `pathlib`),
+không cần `dotenv`, `--env-file` của Docker hoặc `envFrom` của Kubernetes.
+Runner chép SSH key và `known_hosts` vào `/root/.ssh`, đặt quyền `0600`, rồi
+chạy Python; các file mount vẫn chỉ đọc.
+
+Định dạng `.env` hỗ trợ một biến `KEY=value` trên mỗi dòng, dòng trống, comment
+ở đầu dòng (`#`), từ khóa `export` tùy chọn và cặp nháy đơn/đôi bao quanh giá trị.
+Giá trị được giữ nguyên, không nội suy `${VAR}`, không giải mã escape, không
+hỗ trợ giá trị nhiều dòng hoặc inline comment. Đặt comment trên dòng riêng;
+dấu `#` trong giá trị được giữ nguyên. UTF-8 BOM và CRLF được chấp nhận.
+Biến môi trường đã tồn tại được ưu tiên (`override=False`); key lặp trong file
+lấy giá trị cuối cùng. File sai cú pháp dừng khởi động trước khi thay đổi env;
+thông báo chỉ chứa đường dẫn và số dòng, không chứa giá trị.
+
+Env được nạp chỉ thuộc tiến trình bot và các tiến trình con mà bot tạo,
+bao gồm Git/Ansible. `docker exec env` chạy một tiến trình khác nên không hiển
+thị những biến được nạp riêng bên trong bot. Đổi `.env` cần khởi động lại bot.
+
 GitLab token cần quyền API tạo MR, Git SSH key cần đọc repo; Ansible SSH key
 cần kết nối đúng host nonprod. Nếu playbook dùng Ansible Vault, bổ sung secret
 và `ANSIBLE_VAULT_PASSWORD_FILE` vào runtime. Nếu repo khai báo roles/collections,

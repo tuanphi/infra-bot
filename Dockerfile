@@ -16,7 +16,7 @@ RUN ln -sfn /usr/local/bin/python3 /usr/bin/python3
 
 COPY requirements.txt ansible-collections.yml ./
 RUN python -m pip install --no-cache-dir 'pip<25' \
-    && /usr/bin/python3 -m pip install --no-cache-dir -r requirements.txt 'python-gitlab==3.15.0' 'python-dotenv[cli]==1.0.1' \
+    && /usr/bin/python3 -m pip install --no-cache-dir -r requirements.txt 'python-gitlab==3.15.0' \
     && for attempt in 1 2 3; do \
          if ansible-galaxy collection install -r ansible-collections.yml -p /usr/share/ansible/collections; then \
            break; \

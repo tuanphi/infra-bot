@@ -1,7 +1,47 @@
 """Configuration for the Telegram-to-Ansible runner."""
 
 import os
+import re
 from dataclasses import dataclass
+from pathlib import Path
+
+
+def load_env_file(path="/mnt/secrets/.env", override=False):
+    """Load simple one-line KEY=VALUE assignments into os.environ.
+
+    Accept full-line comments, optional export, and matching outer quotes.
+    Values are literal: no interpolation, escape decoding, inline comments,
+    or multiline values. Validate the whole file before changing the environment.
+    Existing environment values win unless override is True.
+    """
+    path = Path(path)
+    values = {}
+    for number, raw in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        assignment = re.fullmatch(
+            r"(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)[ \t]*=(.*)", line
+        )
+        if assignment is None:
+            raise ValueError("Invalid .env assignment at %s:%s" % (path, number))
+
+        key, value = assignment.groups()
+        value = value.strip()
+        if value[:1] in ("'", '"'):
+            if len(value) < 2 or value[-1] != value[0]:
+                raise ValueError("Unclosed .env quote at %s:%s" % (path, number))
+            value = value[1:-1]
+        if "\x00" in value:
+            raise ValueError("Invalid .env value at %s:%s" % (path, number))
+        values[key] = value
+
+    for key, value in values.items():
+        if override:
+            os.environ[key] = value
+        else:
+            os.environ.setdefault(key, value)
 
 
 @dataclass(frozen=True)
