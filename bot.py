@@ -3,6 +3,7 @@
 import asyncio
 from functools import partial
 import logging
+import warnings
 
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
@@ -13,6 +14,10 @@ from workflow import Pipeline, WorkflowError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
+warnings.filterwarnings(
+    "ignore",
+    message=r"Python 3\.8 is no longer supported by the Python core team.*",
+)
 
 def build_application(settings):
     pipeline = Pipeline(settings)
