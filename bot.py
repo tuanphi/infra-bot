@@ -5,19 +5,21 @@ from functools import partial
 import logging
 import warnings
 
+warnings.filterwarnings(
+    "ignore",
+    message=r"Python 3\.8 is no longer supported by the Python core team.*",
+)
+
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 from config import Settings, load_env_file
+from runtime import prepare_repository, start_health_server
 from workflow import Pipeline, WorkflowError
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-warnings.filterwarnings(
-    "ignore",
-    message=r"Python 3\.8 is no longer supported by the Python core team.*",
-)
 
 def build_application(settings):
     pipeline = Pipeline(settings)
@@ -76,6 +78,17 @@ def build_application(settings):
     return app
 
 
-if __name__ == "__main__":
+def main():
     load_env_file("/mnt/secrets/.env", override=False)
-    build_application(Settings.from_env()).run_polling()
+    settings = Settings.from_env()
+    prepare_repository(settings)
+    health = start_health_server(port=settings.health_port)
+    try:
+        build_application(settings).run_polling()
+    finally:
+        health.shutdown()
+        health.server_close()
+
+
+if __name__ == "__main__":
+    main()

@@ -14,6 +14,7 @@ from urllib.request import Request, urlopen
 from urllib.error import URLError
 
 from config import Settings
+from git_auth import git_environment
 
 
 PLAYBOOK = "gitlab-repos.yaml"
@@ -60,8 +61,19 @@ def _command(args, cwd=None, timeout=120, env=None):
     return proc.returncode, output
 
 
-def _git(repo, *args):
-    code, output = _command(["git", "-C", str(repo), *args])
+def git_command(settings, args, cwd=None, timeout=120):
+    try:
+        prefix, env = git_environment(settings.git_repo_url, settings.gitlab_token)
+    except ValueError as exc:
+        raise WorkflowError("Cấu hình Git HTTPS không hợp lệ: %s" % exc) from exc
+    return _command(prefix + list(args), cwd=cwd, timeout=timeout, env=env)
+
+
+def _git(repo, *args, settings=None, timeout=120):
+    if settings is None:
+        code, output = _command(["git", "-C", str(repo), *args], timeout=timeout)
+    else:
+        code, output = git_command(settings, ["-C", str(repo), *args], timeout=timeout)
     if code != 0:
         # Git output may contain URLs with embedded credentials; do not relay it.
         raise WorkflowError("Git thất bại ở bước %s (exit %s)." % (args[0], code))
@@ -150,20 +162,20 @@ class Pipeline:
 
         with tempfile.TemporaryDirectory(prefix="infra-ansible-bot-") as temp:
             repo = Path(temp) / "infra"
-            code, _ = _command([
-                "git", "clone", "--no-tags", "--single-branch", "--branch",
-                base_branch, self.settings.git_repo_url, str(repo),
-            ], timeout=180)
+            code, _ = git_command(self.settings, [
+                "clone", "--no-tags", "--single-branch", "--branch",
+                base_branch, "--", self.settings.git_repo_url, str(repo),
+            ], timeout=self.settings.git_clone_timeout_seconds)
             if code:
                 raise WorkflowError("Không clone được repo Ansible (exit %s)." % code)
 
             source_ref = "refs/remotes/origin/" + branch
             target_ref = "refs/remotes/origin/" + base_branch
-            _git(repo, "fetch", "--no-tags", "origin", "+refs/heads/%s:%s" % (branch, source_ref))
-            commit = _git(repo, "rev-parse", "--verify", source_ref + "^{commit}")
-            base_commit = _git(repo, "rev-parse", "--verify", target_ref + "^{commit}")
-            code, _ = _command([
-                "git", "-C", str(repo), "diff", "--quiet",
+            _git(repo, "fetch", "--no-tags", "origin", "+refs/heads/%s:%s" % (branch, source_ref), settings=self.settings)
+            commit = _git(repo, "rev-parse", "--verify", source_ref + "^{commit}", settings=self.settings)
+            base_commit = _git(repo, "rev-parse", "--verify", target_ref + "^{commit}", settings=self.settings)
+            code, _ = git_command(self.settings, [
+                "-C", str(repo), "diff", "--quiet",
                 base_commit + "..." + commit,
             ])
             if code == 0:
@@ -171,7 +183,7 @@ class Pipeline:
             if code != 1:
                 raise WorkflowError("Không so sánh được source branch với branch đích.")
 
-            _git(repo, "switch", "--detach", commit)
+            _git(repo, "checkout", "--detach", commit, settings=self.settings)
             if not (repo / INVENTORY).is_file() or not (repo / PLAYBOOK).is_file():
                 raise WorkflowError("Branch thiếu file nonprod hoặc gitlab-repos.yaml ở thư mục gốc.")
 
@@ -194,7 +206,7 @@ class Pipeline:
                 raise WorkflowError("Ansible exit 0 nhưng không có PLAY RECAP hợp lệ; dừng trước MR.")
 
             # A moved branch would make the MR review a different commit.
-            remote = _git(repo, "ls-remote", "--exit-code", "origin", "refs/heads/" + branch)
+            remote = _git(repo, "ls-remote", "--exit-code", "origin", "refs/heads/" + branch, settings=self.settings)
             if not remote or remote.split()[0] != commit:
                 raise WorkflowError("Branch đã đổi commit trong lúc chạy; dừng trước khi tạo MR.")
 

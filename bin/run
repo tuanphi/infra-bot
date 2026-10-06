@@ -11,7 +11,7 @@ keysMountedPath="/mnt/secrets"
 keys=".env git_private.pem known_hosts"
 
 for key in ${keys}; do
-  if [ ! -f ${keysMountedPath}/${key} ]; then
+  if [ ! -f "${keysMountedPath}/${key}" ]; then
     echo "Not found ${keysMountedPath}/${key} !"
     exit 1
   fi
@@ -21,5 +21,16 @@ for key in ${keys}; do
   echo "Linked ${key} -> ${keysMountedPath}/${key}"
   echo
 done
+
+# SSH/Ansible use the default identity paths
+mkdir -p /root/.ssh
+chmod 700 /root/.ssh
+cp "${keysMountedPath}/git_private.pem" /root/.ssh/id_ed25519
+echo "Copied ${keysMountedPath}/git_private.pem -> /root/.ssh/id_ed25519"
+
+cp "${keysMountedPath}/known_hosts" /root/.ssh/known_hosts
+echo "Copied ${keysMountedPath}/known_hosts -> /root/.ssh/known_hosts"
+
+chmod 600 /root/.ssh/id_ed25519 /root/.ssh/known_hosts
 
 exec python3 /app/bot.py

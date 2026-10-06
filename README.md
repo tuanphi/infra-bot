@@ -8,8 +8,8 @@ Ansible thành công:
 ansible-playbook -i nonprod gitlab-repos.yaml --tags=project_user_access
 ```
 
-Chỉ có `/run <source-branch>`, `/start` và `/help`. Không chứa OCR, VPN,
-Terragrunt hay Google Sheets. Source branch **phải được commit/push từ trước**
+Telegram hỗ trợ `/run <source-branch>`, `/start` và `/help`.
+Source branch **phải được commit/push từ trước**
 và có diff so với `GIT_TARGET_BRANCH`. Chạy một playbook hiện có không tự tạo
 diff cho MR; vì chưa biết định dạng biến `project_user_access` trong repo Ansible,
 bot không tự sửa playbook/inventory. GitLab repo không truy cập được trong môi
@@ -33,6 +33,46 @@ thứ tự yêu cầu. Chạy lại cùng branch có thể chạy lại Ansible;
 tính idempotent. Bot chỉ cho phép một lượt chạy tại một thời điểm trong một
 process; triển khai đúng **một replica** khi dùng Telegram polling.
 
+## Khởi động và HTTP health
+
+Sau khi runner chuẩn bị SSH key, bot đọc `/mnt/secrets/.env`, kiểm tra cấu hình
+và clone repo Ansible vào `/app/infra` trước khi mở HTTP health và Telegram polling.
+Đặt các biến sau trong file `.env`:
+
+```dotenv
+GIT_REPO_URL=https://gitlab.g-pay.vn/devops/ansible/infra.git
+GIT_TARGET_BRANCH=master
+GIT_CLONE_DIR=/app/infra
+GIT_CLONE_TIMEOUT_SECONDS=180
+HEALTH_PORT=8080
+```
+
+`GIT_CLONE_DIR`, `GIT_CLONE_TIMEOUT_SECONDS` và `HEALTH_PORT` có các giá trị mặc
+định như ví dụ, nên không bắt buộc khai báo. `GITLAB_TOKEN` hiện có được dùng để
+xác thực HTTPS qua Git credential helper, dùng username `oauth2`. Token cần quyền
+đọc repo và quyền API tạo MR. Token không được nhúng trong URL, argv của Git hoặc
+`remote.origin.url`; helper chỉ trả credential cho đúng host và đường dẫn repo.
+Giữ xác minh TLS; CA nội bộ phải có trong trust store hoặc cấu hình Git bằng
+`GIT_SSL_CAINFO` trỏ đến file CA đã mount.
+
+Nếu checkout đã tồn tại, bot kiểm tra origin và working tree, fetch branch rồi
+checkout detached commit mới nhất của `origin/GIT_TARGET_BRANCH`. Nếu thư mục có
+dữ liệu khác, origin không khớp hoặc có thay đổi local, bot dừng khởi động và giữ
+nguyên dữ liệu. Clone/fetch lỗi hoặc vượt timeout cũng dừng khởi động.
+
+`GET /health` và `HEAD /health` trả HTTP **200**; các path khác trả **404**.
+HTTP dùng thư viện chuẩn Python, lắng nghe trên `0.0.0.0:8080` mặc định và chạy
+trong thread riêng để vẫn nhận probe khi Ansible đang chạy. Response GET:
+
+```json
+{"status":"ok"}
+```
+
+Health mở sau khi clone thành công. Nếu dùng startup/liveness probe, dành đủ
+thời gian cho bước clone lúc khởi động. HTTP server đóng khi polling kết thúc.
+Mỗi `/run` vẫn dùng checkout tạm riêng để giữ commit đang chạy và `/app/infra`
+không bị chuyển sang source branch của một lượt Ansible.
+
 ## Runtime
 
 `Dockerfile` dùng Python `3.8.10`, cài `ansible-core==2.12.10`,
@@ -41,12 +81,15 @@ MarkupSafe được pin vì Jinja cũ cần `soft_unicode`. Ảnh base cũ cần
 mirror/nâng cấp theo chính sách bảo mật riêng nếu đem dùng lâu dài.
 
 ```bash
-docker build -t infra-ansible-bot:python-env .
+docker build -t infra-ansible-bot:health-startup .
 docker run --rm --name infra-bot \
+  -p 8080:8080 \
   -v /home/tuanpv/.ssh/id_ed25519:/mnt/secrets/git_private.pem:ro \
   -v /home/tuanpv/.ssh/known_hosts:/mnt/secrets/known_hosts:ro \
   -v /home/tuanpv/g-pay/zerotrust-alert/.env:/mnt/secrets/.env:ro \
-  infra-ansible-bot:python-env
+  infra-ansible-bot:health-startup
+
+curl -i http://localhost:8080/health
 ```
 
 Tạo `.env` từ `.env.example`, điền token và ID thật; **không commit `.env` hoặc
@@ -71,8 +114,9 @@ Env được nạp chỉ thuộc tiến trình bot và các tiến trình con m�
 bao gồm Git/Ansible. `docker exec env` chạy một tiến trình khác nên không hiển
 thị những biến được nạp riêng bên trong bot. Đổi `.env` cần khởi động lại bot.
 
-GitLab token cần quyền API tạo MR, Git SSH key cần đọc repo; Ansible SSH key
-cần kết nối đúng host nonprod. Nếu playbook dùng Ansible Vault, bổ sung secret
+GitLab token cần quyền API tạo MR và đọc repo qua HTTPS; Ansible SSH key
+cần kết nối đúng host nonprod. Nếu dùng URL Git SSH, key cũng cần quyền đọc repo.
+Nếu playbook dùng Ansible Vault, bổ sung secret
 và `ANSIBLE_VAULT_PASSWORD_FILE` vào runtime. Nếu repo khai báo roles/collections,
 cài đúng phiên bản theo repo trước khi chạy.
 
@@ -89,5 +133,7 @@ python -m unittest discover -s tests -v
 ```
 
 Test dùng repo Git local và executable Ansible giả để xác nhận đúng argv,
-chỉ tạo MR sau exit 0, và từ chối branch không có diff. Test không kết nối
-GitLab thật hay Ansible server thật.
+chỉ tạo MR sau exit 0, và từ chối branch không có diff. Test startup kiểm tra
+clone/cập nhật checkout, giữ dữ liệu local, credential helper qua Git thật,
+HTTP 200/404 và thứ tự khởi động. Test không kết nối GitLab/Telegram thật hay
+Ansible server thật.

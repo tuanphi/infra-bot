@@ -56,6 +56,9 @@ class Settings:
     gitlab_token: str
     ansible_timeout_seconds: int = 1800
     ansible_binary: str = "ansible-playbook"
+    health_port: int = 8080
+    git_clone_dir: str = "/app/infra"
+    git_clone_timeout_seconds: int = 180
 
     @classmethod
     def from_env(cls):
@@ -77,6 +80,15 @@ class Settings:
         timeout = int(os.getenv("ANSIBLE_TIMEOUT_SECONDS", "1800"))
         if timeout <= 0:
             raise ValueError("ANSIBLE_TIMEOUT_SECONDS must be positive")
+        health_port = int(os.getenv("HEALTH_PORT", "8080"))
+        if not 1 <= health_port <= 65535:
+            raise ValueError("HEALTH_PORT must be between 1 and 65535")
+        clone_timeout = int(os.getenv("GIT_CLONE_TIMEOUT_SECONDS", "180"))
+        if clone_timeout <= 0:
+            raise ValueError("GIT_CLONE_TIMEOUT_SECONDS must be positive")
+        clone_dir = os.getenv("GIT_CLONE_DIR", "/app/infra").strip()
+        if not Path(clone_dir).is_absolute():
+            raise ValueError("GIT_CLONE_DIR must be an absolute path")
         return cls(
             telegram_token=os.environ["TELEGRAM_TOKEN"],
             allowed_group_id=int(os.environ["ALLOWED_GROUP_ID"]),
@@ -88,4 +100,7 @@ class Settings:
             gitlab_token=os.environ["GITLAB_TOKEN"],
             ansible_timeout_seconds=timeout,
             ansible_binary=os.getenv("ANSIBLE_PLAYBOOK_BIN", "ansible-playbook"),
+            health_port=health_port,
+            git_clone_dir=clone_dir,
+            git_clone_timeout_seconds=clone_timeout,
         )
