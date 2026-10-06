@@ -45,7 +45,8 @@ docker build -t infra-ansible-bot:1.0 .
 docker run --rm --env-file .env \
   -v /home/tuanpv/.ssh/id_ed25519:/run/secrets/git_id_ed25519:ro \
   -v /home/tuanpv/.ssh/known_hosts:/root/.ssh/known_hosts:ro \
-  infra-ansible-bot:1.0
+  -v /home/tuanpv/g-pay/zerotrust-alert/.env:/mnt/secrets/.env \
+  infra-ansible-bot:v1.2
 ```
 
 Tạo `.env` từ `.env.example`, điền token và ID thật; **không commit `.env` hoặc

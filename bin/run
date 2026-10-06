@@ -8,15 +8,20 @@ log() {
 }
 
 keysMountedPath="/mnt/secrets"
-envConfigFile=".env"
+keys=".env git_private.pem known_hosts"
 
-if [ -f ${keysMountedPath}/${envConfigFile} ]; then
-  log "Found environment configuration."
-  ln -s ${keysMountedPath}/${envConfigFile} ${envConfigFile}
-  log "Linked ${keysMountedPath}/${envConfigFile} -> ${envConfigFile}"
-else
-  log "Not found environment configuration."
-  log "Application will be started with default configuration."
-fi
+for key in ${keys}; do
+  if [ ! -f ${keysMountedPath}/${key} ]; then
+    echo "Not found ${keysMountedPath}/${key} !"
+    exit 1
+  fi
 
-exec python bot.py
+  echo "Found ${key} in ${keysMountedPath}"
+  if [ -f ${key} ]; then
+    ln -s ${keysMountedPath}/${key} ${key}
+    echo "Linked ${key} -> ${keysMountedPath}/${key}"
+  fi
+  echo
+done
+
+exec dotenv -f $ENV_FILE run --no-override python3 /app/bot.py
