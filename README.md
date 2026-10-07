@@ -4,7 +4,7 @@ Bot hỗ trợ `/gitlab` để nhập namespace/service/user, chọn role và x�
 Yes/No trước khi cập nhật `group_vars/gitlab-ghub` trên branch `master`.
 Bot gửi toàn bộ Git status/diff và chạy
 `ansible-playbook -i nonprod gitlab-repos-ghub.yaml --tags=<namespace>,project_user_access`
-khi kiểm tra hợp lệ. Xem [hướng dẫn luồng /gitlab](GITLAB-FLOW.md).
+khi kiểm tra hợp lệ. Xem [hướng dẫn luồng /gitlab](GITLAB-REPO-ROLE-FLOW.md).
 
 Luồng `/run <source-branch>` chạy lệnh dưới đây từ thư mục gốc của source
 `gitlab.g-pay.vn/devops/ansible/infra`, sau đó tạo GitLab Merge Request khi
@@ -14,7 +14,11 @@ Ansible thành công:
 ansible-playbook -i nonprod gitlab-repos.yaml --tags=project_user_access
 ```
 
-Telegram hỗ trợ `/gitlab`, `/cancel`, `/run <source-branch>`, `/start` và `/help`.
+Telegram hỗ trợ `/gitlab`, `/cancel`, `/run <source-branch>`, `/whoami`, `/id`, `/start` và `/help`.
+`/whoami` cho biết ID của người gửi và chat để đối chiếu `ALLOWED_USER_IDS`/
+`ALLOWED_GROUP_ID`. Tin nhắn riêng cần `ALLOW_PRIVATE_CHAT=true` và user được
+whitelist; mặc định chỉ dùng trong nhóm đã cấu hình. Xem
+[hướng dẫn sửa quyền Telegram](TELEGRAM-AUTH-FIX.md).
 Source branch **phải được commit/push từ trước**
 và có diff so với `GIT_TARGET_BRANCH`. Chạy một playbook hiện có không tự tạo
 diff cho MR. `/run` dùng source đã commit; `/gitlab` sửa membership trong file

@@ -4,10 +4,12 @@ import asyncio
 from functools import partial
 import logging
 import secrets
+import warnings
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TelegramError
 from telegram.ext import CallbackQueryHandler, CommandHandler, ConversationHandler, MessageHandler, filters
+from telegram.warnings import PTBUserWarning
 
 from gitlab_access import GitCheckError, ROLES, USERNAME
 from workflow import WorkflowError
@@ -50,8 +52,18 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
     async def backend(function, *args):
         return await asyncio.get_running_loop().run_in_executor(None, partial(function, *args))
 
-    async def clear_session(ctx):
-        session = ctx.user_data.pop(SESSION_KEY, None)
+    def get_session(update, ctx):
+        return ctx.user_data.get(SESSION_KEY, {}).get(update.effective_chat.id)
+
+    def pop_session(update, ctx):
+        sessions = ctx.user_data.get(SESSION_KEY, {})
+        session = sessions.pop(update.effective_chat.id, None)
+        if not sessions:
+            ctx.user_data.pop(SESSION_KEY, None)
+        return session
+
+    async def clear_session(update, ctx):
+        session = pop_session(update, ctx)
         if session and session.get("menu_id"):
             try:
                 await ctx.bot.edit_message_reply_markup(
@@ -63,11 +75,11 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
     async def start(update, ctx):
         if not await authorized(update):
             return ConversationHandler.END
-        await clear_session(ctx)
+        await clear_session(update, ctx)
         if run_lock.locked():
             await update.effective_message.reply_text("Đang có một lượt Ansible chạy; thử lại sau.")
             return ConversationHandler.END
-        ctx.user_data[SESSION_KEY] = {
+        ctx.user_data.setdefault(SESSION_KEY, {})[update.effective_chat.id] = {
             "nonce": secrets.token_hex(6), "chat_id": update.effective_chat.id,
         }
         await update.effective_message.reply_text("Nhập tên namespace")
@@ -84,14 +96,14 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
         except WorkflowError as exc:
             await reply_full(update.effective_message, "❌ %s\nNhập tên namespace" % exc)
             return NAMESPACE
-        ctx.user_data[SESSION_KEY].update(namespace=namespace, services=services)
+        get_session(update, ctx).update(namespace=namespace, services=services)
         await update.effective_message.reply_text("Nhập tên service")
         return SERVICE
 
     async def service_input(update, ctx):
         if not await authorized(update):
             return ConversationHandler.END
-        session = ctx.user_data[SESSION_KEY]
+        session = get_session(update, ctx)
         service = update.effective_message.text.strip()
         if service not in session["services"]:
             await reply_full(update.effective_message,
@@ -109,7 +121,7 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
         if not USERNAME.fullmatch(username):
             await update.effective_message.reply_text("Tên user không hợp lệ. Nhập username GitLab, ví dụ tuanpv.")
             return USER
-        session = ctx.user_data[SESSION_KEY]
+        session = get_session(update, ctx)
         session["username"] = username
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton(role, callback_data="gitlab:%s:role:%s" % (session["nonce"], role))]
@@ -124,7 +136,7 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
         if not await authorized(update):
             await query.answer("Bạn không có quyền dùng bot này.", show_alert=True)
             return None
-        session = ctx.user_data.get(SESSION_KEY)
+        session = get_session(update, ctx)
         parts = query.data.split(":")
         if (not session or len(parts) != 4 or parts[1] != session["nonce"]
                 or query.message.message_id != session.get("menu_id")):
@@ -146,7 +158,7 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
             if isinstance(exc, GitCheckError):
                 await reply_git_report(update.effective_message, exc.report)
             await reply_full(update.effective_message, "❌ " + str(exc))
-            await clear_session(ctx)
+            await clear_session(update, ctx)
             return ConversationHandler.END
         session["request"] = request
         status = ("user %s đang có role %s" % (request.username, ", ".join(request.current_roles))
@@ -201,7 +213,7 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
         answer = update.callback_query.data.rsplit(":", 1)[1]
         request = session["request"]
         await update.callback_query.edit_message_reply_markup(reply_markup=None)
-        ctx.user_data.pop(SESSION_KEY, None)
+        pop_session(update, ctx)
         if answer == "no":
             await update.effective_message.reply_text("Đã dừng luồng.")
         else:
@@ -212,7 +224,7 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
 
     async def cancel(update, ctx):
         if await authorized(update):
-            await clear_session(ctx)
+            await clear_session(update, ctx)
             await update.effective_message.reply_text("Đã dừng luồng.")
         return ConversationHandler.END
 
@@ -224,18 +236,27 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
         await update.callback_query.answer("Lựa chọn đã hết hạn hoặc thuộc người khác. Chạy /gitlab để bắt đầu.", show_alert=True)
 
     text = filters.TEXT & ~filters.COMMAND
-    conversation = ConversationHandler(
-        entry_points=[CommandHandler("gitlab", start)],
-        states={
-            NAMESPACE: [MessageHandler(text, namespace_input)],
-            SERVICE: [MessageHandler(text, service_input)],
-            USER: [MessageHandler(text, user_input)],
-            ROLE: [CallbackQueryHandler(role_input, pattern=r"^gitlab:[0-9a-f]{12}:role:(maintainer|developer|reporter|guest)$"),
-                   MessageHandler(text, use_buttons)],
-            CONFIRM: [CallbackQueryHandler(confirmation_input, pattern=r"^gitlab:[0-9a-f]{12}:confirm:(yes|no)$"),
-                      MessageHandler(text, use_buttons)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        allow_reentry=True, per_chat=True, per_user=True, per_message=False,
-    )
+    # This flow spans text messages and several inline menus. Track by chat/user;
+    # callback_session additionally checks the keyboard nonce and message ID.
+    # per_message=True would exclude the text/command steps. Suppress only this
+    # expected advisory during construction, leaving other PTB warnings visible.
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore", category=PTBUserWarning,
+            message=r"If 'per_message=False', 'CallbackQueryHandler' will not be tracked for every message\..*",
+        )
+        conversation = ConversationHandler(
+            entry_points=[CommandHandler("gitlab", start)],
+            states={
+                NAMESPACE: [MessageHandler(text, namespace_input)],
+                SERVICE: [MessageHandler(text, service_input)],
+                USER: [MessageHandler(text, user_input)],
+                ROLE: [CallbackQueryHandler(role_input, pattern=r"^gitlab:[0-9a-f]{12}:role:(maintainer|developer|reporter|guest)$"),
+                       MessageHandler(text, use_buttons)],
+                CONFIRM: [CallbackQueryHandler(confirmation_input, pattern=r"^gitlab:[0-9a-f]{12}:confirm:(yes|no)$"),
+                          MessageHandler(text, use_buttons)],
+            },
+            fallbacks=[CommandHandler("cancel", cancel)],
+            allow_reentry=True, per_chat=True, per_user=True, per_message=False,
+        )
     return conversation, CallbackQueryHandler(stale_callback, pattern=r"^gitlab:")

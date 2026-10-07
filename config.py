@@ -61,6 +61,7 @@ class Settings:
     git_clone_dir: str = "/app/infra"
     git_clone_timeout_seconds: int = 180
     gitlab_username: str = ""
+    allow_private_chat: bool = False
 
     @classmethod
     def from_env(cls):
@@ -75,12 +76,22 @@ class Settings:
         if missing:
             raise ValueError("Missing configuration: " + ", ".join(missing))
 
-        ids = frozenset(
-            int(item.strip()) for item in os.environ["ALLOWED_USER_IDS"].split(",")
-            if item.strip()
-        )
+        try:
+            ids = frozenset(
+                int(item.strip()) for item in os.environ["ALLOWED_USER_IDS"].split(",")
+                if item.strip()
+            )
+        except ValueError:
+            raise ValueError("ALLOWED_USER_IDS must contain numeric Telegram user IDs separated by commas") from None
         if not ids:
             raise ValueError("ALLOWED_USER_IDS must contain at least one Telegram user ID")
+        try:
+            group_id = int(os.environ["ALLOWED_GROUP_ID"])
+        except ValueError:
+            raise ValueError("ALLOWED_GROUP_ID must be a numeric Telegram group ID") from None
+        private_chat = os.getenv("ALLOW_PRIVATE_CHAT", "false").strip().lower()
+        if private_chat not in ("true", "false", "1", "0"):
+            raise ValueError("ALLOW_PRIVATE_CHAT must be true, false, 1 or 0")
         timeout = int(os.getenv("ANSIBLE_TIMEOUT_SECONDS", "1800"))
         if timeout <= 0:
             raise ValueError("ANSIBLE_TIMEOUT_SECONDS must be positive")
@@ -95,7 +106,7 @@ class Settings:
             raise ValueError("GIT_CLONE_DIR must be an absolute path")
         return cls(
             telegram_token=os.environ["TELEGRAM_TOKEN"],
-            allowed_group_id=int(os.environ["ALLOWED_GROUP_ID"]),
+            allowed_group_id=group_id,
             allowed_user_ids=ids,
             git_repo_url=os.environ["GIT_REPO_URL"],
             git_target_branch=os.environ["GIT_TARGET_BRANCH"],
@@ -103,6 +114,7 @@ class Settings:
             gitlab_project_id=os.environ["GITLAB_PROJECT_ID"],
             gitlab_token=os.environ["GITLAB_TOKEN"],
             gitlab_username=os.getenv("GITLAB_USERNAME", "").strip(),
+            allow_private_chat=private_chat in ("true", "1"),
             ansible_timeout_seconds=timeout,
             ansible_binary=os.getenv("ANSIBLE_PLAYBOOK_BIN", "ansible-playbook"),
             health_port=health_port,
