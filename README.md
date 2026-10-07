@@ -1,6 +1,12 @@
 # Ansible Telegram bot
 
-Bot này chạy đúng lệnh dưới đây từ thư mục gốc của source
+Bot hỗ trợ `/gitlab` để nhập namespace/service/user, chọn role và xác nhận
+Yes/No trước khi cập nhật `group_vars/gitlab-ghub` trên branch `master`.
+Bot gửi toàn bộ Git status/diff và chạy
+`ansible-playbook -i nonprod gitlab-repos-ghub.yaml --tags=<namespace>,project_user_access`
+khi kiểm tra hợp lệ. Xem [hướng dẫn luồng /gitlab](GITLAB-FLOW.md).
+
+Luồng `/run <source-branch>` chạy lệnh dưới đây từ thư mục gốc của source
 `gitlab.g-pay.vn/devops/ansible/infra`, sau đó tạo GitLab Merge Request khi
 Ansible thành công:
 
@@ -8,11 +14,11 @@ Ansible thành công:
 ansible-playbook -i nonprod gitlab-repos.yaml --tags=project_user_access
 ```
 
-Telegram hỗ trợ `/run <source-branch>`, `/start` và `/help`.
+Telegram hỗ trợ `/gitlab`, `/cancel`, `/run <source-branch>`, `/start` và `/help`.
 Source branch **phải được commit/push từ trước**
 và có diff so với `GIT_TARGET_BRANCH`. Chạy một playbook hiện có không tự tạo
-diff cho MR; vì chưa biết định dạng biến `project_user_access` trong repo Ansible,
-bot không tự sửa playbook/inventory. GitLab repo không truy cập được trong môi
+diff cho MR. `/run` dùng source đã commit; `/gitlab` sửa membership trong file
+`group_vars/gitlab-ghub` theo cấu trúc đã cung cấp. GitLab repo không truy cập được trong môi
 trường thiết kế này, do đó cần kiểm tra inventory `nonprod`, vị trí playbook
 và các dependency role/collection tại môi trường của bạn.
 
@@ -73,7 +79,8 @@ token/credential. Exit 128 chưa đủ để xác định lỗi xác thực: log
 biệt `Authentication failed`, lỗi certificate, DNS/network hoặc branch không tồn tại.
 
 Nếu checkout đã tồn tại, bot kiểm tra origin và working tree, fetch branch rồi
-checkout detached commit mới nhất của `origin/GIT_TARGET_BRANCH`. Nếu thư mục có
+checkout branch `GIT_TARGET_BRANCH`, cập nhật bằng merge `--ff-only` từ
+`origin/GIT_TARGET_BRANCH`. Nếu thư mục có
 dữ liệu khác, origin không khớp hoặc có thay đổi local, bot dừng khởi động và giữ
 nguyên dữ liệu. Clone/fetch lỗi hoặc vượt timeout cũng dừng khởi động.
 
@@ -149,9 +156,9 @@ hiện thủ công trên cùng commit và cùng môi trường; bot chỉ trả 
 python -m unittest discover -s tests -v
 ```
 
-Test dùng repo Git local và executable Ansible giả để xác nhận đúng argv,
-chỉ tạo MR sau exit 0, và từ chối branch không có diff. Test startup kiểm tra
-clone/cập nhật checkout, giữ dữ liệu local, credential helper qua Git thật,
-clone/fetch qua HTTPS có Basic authentication trên server local, che token trong
-lỗi xác thực/timeout, lỗi CA và HTTP 200/404. Test không kết nối GitLab/Telegram thật hay
-Ansible server thật.
+Test dùng repo Git local và executable Ansible giả để xác nhận đúng argv/cwd,
+chỉ tạo MR của `/run` sau exit 0, và từ chối branch không có diff. Test `/gitlab`
+kiểm tra hội thoại, Yes/No, role, diff, thay đổi đồng thời và khóa chạy chung.
+Test startup kiểm tra branch master, cập nhật fast-forward và giữ commit khi
+branch phân kỳ. Bot API giả chạy trong bộ nhớ; test không kết nối
+GitLab/Telegram thật hay Ansible server thật.

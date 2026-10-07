@@ -30,7 +30,7 @@ RUN python -m pip install --no-cache-dir 'pip<25' \
     && /usr/bin/python3 -c "import sys, jinja2, gitlab; assert sys.version_info[:3] == (3, 8, 10); assert jinja2.__version__ == '2.10.1'" \
     && ansible --version | grep -F 'ansible [core 2.12.10]'
 
-COPY config.py git_auth.py runtime.py workflow.py bot.py ./
+COPY config.py git_auth.py runtime.py workflow.py gitlab_access.py gitlab_conversation.py bot.py ./
 COPY bin/run ./bin/run
 
 RUN chmod +x ./bin/run

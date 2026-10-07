@@ -1,0 +1,1496 @@
+diff --git a/Dockerfile b/Dockerfile
+index e6b3d96..fd6fbd6 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -30,7 +30,7 @@ RUN python -m pip install --no-cache-dir 'pip<25' \
+     && /usr/bin/python3 -c "import sys, jinja2, gitlab; assert sys.version_info[:3] == (3, 8, 10); assert jinja2.__version__ == '2.10.1'" \
+     && ansible --version | grep -F 'ansible [core 2.12.10]'
+ 
+-COPY config.py git_auth.py runtime.py workflow.py bot.py ./
++COPY config.py git_auth.py runtime.py workflow.py gitlab_access.py gitlab_conversation.py bot.py ./
+ COPY bin/run ./bin/run
+ 
+ RUN chmod +x ./bin/run
+diff --git a/GITLAB-FLOW.md b/GITLAB-FLOW.md
+new file mode 100644
+index 0000000..788aee1
+--- /dev/null
++++ b/GITLAB-FLOW.md
+@@ -0,0 +1,168 @@
++# Luồng /gitlab
++
++Triển khai dựa trên commit `90a5959` của `tuanphi/infra-bot`, dùng cấu trúc
++file `gitlab-ghub(1)` đã cung cấp. Các file mới là `gitlab_access.py` và
++`gitlab_conversation.py`; `bot.py`, `runtime.py`, `Dockerfile` và
++`requirements.txt` tích hợp luồng mới. Luồng `/run <source-branch>` vẫn có thể dùng.
++
++## Hội thoại
++
++```mermaid
++flowchart TD
++    A["/gitlab: nhập namespace, service, user"] --> B["Chọn role; xem role hiện tại"]
++    B --> C{"Bạn có muốn thực hiện thay đổi?"}
++    C -->|No| D["Dừng"]
++    C -->|Yes| E["Sửa users_access; gửi git status và git diff"]
++    E --> F{"Git và diff hợp lệ?"}
++    F -->|False| D
++    F -->|True| G["Chạy Ansible trong /app/infra"]
++```
++
++1. `/gitlab` → bot hiển thị **Nhập tên namespace**.
++2. Nhập `ghub-website` → bot kiểm tra namespace, hiển thị **Nhập tên service**.
++3. Nhập `merchant-portal-client` → bot kiểm tra service, hiển thị **Nhập tên user**.
++4. Nhập `tuanpv` → bot hiển thị **Chọn role**, với bốn nút:
++   `maintainer`, `developer`, `reporter`, `guest`. Mỗi yêu cầu chọn một role.
++5. Chọn `developer` → bot đọc đúng service trong YAML, hiển thị:
++
++   ```text
++   user tuanpv chưa có role
++   Namespace: ghub-website
++   Service: merchant-portal-client
++   Role được chọn: developer
++
++   Bạn có muốn thực hiện thay đổi?
++   [Yes] [No]
++   ```
++
++   Nếu đã có quyền, dòng đầu là `user tuanpv đang có role developer`
++   hoặc role hiện tại tương ứng. Thông tin này lấy từ YAML của service đó;
++   trạng thái quyền trên GitLab thật cần được đồng bộ qua playbook.
++
++6. Chọn **No** hoặc gửi `/cancel` → dừng, chưa sửa file/chạy Ansible.
++7. Chọn **Yes** → backend sửa YAML, gửi đầy đủ output của `git status`
++   và `git diff group_vars/gitlab-ghub`, rồi chạy Ansible nếu kiểm tra hợp lệ.
++
++Chỉ Telegram user thuộc `ALLOWED_USER_IDS`, trong `ALLOWED_GROUP_ID`, mới được
++đi qua luồng. Nút của người khác, nút của phiên cũ hoặc nút đã xác nhận không
++thể áp dụng lại yêu cầu. `/gitlab` có thể khởi tạo lại phiên trước khi xác nhận.
++Sau Yes, tác vụ chạy riêng và không bị hủy bởi `/cancel`.
++
++## Tìm namespace và service
++
++| Đầu vào | Trường dùng để đối chiếu |
++| --- | --- |
++| Namespace | `gitlab_groups[].path` và key `gitlab_projects.<namespace>` |
++| Service | Phần cuối `gitlab_projects.<namespace>.project[].path` |
++| Đường dẫn project | `<gitlab_groups[].parent>/<namespace>/<service>` |
++| User và role | `users_access[].users` và `users_access[].level` của project đã tìm |
++
++Đối chiếu chính xác; không tìm theo chuỗi con hoặc tên hiển thị `project.name`.
++Ví dụ `api-gateway` ở `ghub-customer` và `ghub-connector` là hai service khác nhau.
++Không tìm thấy, trùng đường dẫn project, YAML trùng key hoặc dùng alias: dừng với
++thông báo lỗi. Bốn role phải có sẵn; `users` dùng inline list như file cung cấp.
++
++## Sửa YAML và xác minh Git
++
++Trước khi sửa, repo phải ở branch `master`, có working tree/index sạch, có các
++file thường `group_vars/gitlab-ghub`, `nonprod` và `gitlab-repos-ghub.yaml`.
++Repo, commit và nội dung file được kiểm tra lại sau khi user chọn Yes.
++
++- User chưa có role: thêm vào danh sách của role đã chọn.
++- User đang có role khác: bỏ khỏi role cũ trong service này, thêm vào role mới.
++- User đã có đúng role: không tạo diff và dừng trước Ansible.
++- User nằm ở nhiều role trong cùng service: sau thay đổi chỉ giữ role đã chọn.
++
++Chỉ các giá trị danh sách `users` cần thay đổi được thay thế. Comment bên ngoài
++những danh sách này, thụt lề, dấu nháy và mọi nội dung khác giữ nguyên.
++
++Ví dụ diff khi thêm `tuanpv`:
++
++```diff
++             - level: developer
++-            users: ["anhtn", "trung"]
+++            users: ["anhtn", "trung", "tuanpv"]
++```
++
++Backend yêu cầu đồng thời:
++
++1. Branch vẫn là `master`, HEAD vẫn là commit đã dùng để xem role.
++2. `git status --porcelain=v1 -z --untracked-files=all` chỉ có
++   ` M group_vars/gitlab-ghub`; không có file staged, untracked hoặc file khác.
++3. Diff có nội dung; file trên đĩa khớp bản sửa được tính từ yêu cầu đã xác nhận.
++4. Cấu trúc YAML sau sửa chỉ đổi membership của đúng user trong service đã chọn.
++
++Bot gửi toàn bộ hai output Git dưới dạng text thường, chia tin theo giới hạn
++Telegram nếu cần. Không cắt ngắn hai output này. Máy dùng dữ liệu porcelain và
++so sánh nội dung để kiểm tra, không phụ thuộc cách diễn đạt của `git status`.
++
++Kiểm tra False: dừng trước Ansible. Nếu đã sửa file, backend phục hồi riêng bản
++sửa của lượt hiện tại khi file vẫn khớp bản bot đã ghi. Thay đổi khác của người
++vận hành được giữ nguyên. Không dùng `git reset --hard`.
++
++## Chạy playbook và giữ kết quả
++
++Backend kiểm tra lại ngay trước khi gọi subprocess, với thư mục làm việc là
++`GIT_CLONE_DIR` (mặc định `/app/infra`) và argv cố định:
++
++```bash
++ansible-playbook -i nonprod gitlab-repos-ghub.yaml --tags=ghub-website,project_user_access
++```
++
++`ghub-website` được thay bằng namespace đã chọn. Không ghép shell command từ
++nội dung người dùng. Một khóa dùng chung với `/run` chỉ cho phép một lượt
++Ansible trong một process; dùng một replica cho Telegram polling.
++
++`--tags=namespace,project_user_access` chọn task khớp **một trong hai** tag;
++phạm vi thực thi còn phụ thuộc cách gắn tag/include/role trong playbook.
++Cần kiểm tra `gitlab-repos-ghub.yaml` và các task của repo infra để xác nhận
++phạm vi quyền thực tế. Tham khảo
++[Ansible: Selecting or skipping tags](https://docs.ansible.com/projects/ansible-core/2.13/user_guide/playbooks_tags.html#selecting-or-skipping-tags-when-you-run-a-playbook).
++
++Ansible exit 0: bot gửi kết quả và PLAY RECAP nếu có. Exit khác 0 hoặc timeout:
++bot báo lỗi và giữ diff để kiểm tra vì playbook có thể đã áp dụng một phần.
++
++Sau khi chạy, file YAML giữ thay đổi chưa commit. Người vận hành cần xử lý
++diff này bằng quy trình Git hiện có trước lượt `/gitlab` tiếp theo hoặc trước
++khi khởi động lại bot. Bảy bước này kết thúc ở chạy Ansible; việc commit/push/MR
++không được tự bổ sung vào luồng.
++
++## Cài vào infra-bot
++
++Giải nén gói ZIP rồi áp dụng patch tại thư mục gốc infra-bot:
++
++```bash
++git apply --check /path/to/infra-bot-gitlab.patch
++git apply /path/to/infra-bot-gitlab.patch
++docker build -t infra-ansible-bot:gitlab-flow .
++```
++
++Giữ các biến hiện có trong `/mnt/secrets/.env`; đặt:
++
++```dotenv
++GIT_TARGET_BRANCH=master
++GIT_CLONE_DIR=/app/infra
++```
++
++Hai module mới được COPY vào image và PyYAML 6.0.1 được cài từ requirements.
++Các biến xác thực GitLab và Telegram vẫn dùng cấu hình hiện tại. Không cần biến
++môi trường mới cho luồng `/gitlab`.
++
++Startup clone trên branch đã cấu hình; checkout hiện có được cập nhật bằng
++checkout branch và merge `--ff-only`, thay cho detached HEAD. Repo có diff
++local vẫn dừng startup để giữ dữ liệu; branch phân kỳ dừng thay vì reset commit.
++HTTP `/health` giữ hành vi hiện có.
++
++## Kiểm chứng
++
++```bash
++python -m pip install 'python-telegram-bot==20.7' 'PyYAML==6.0.1'
++python -m unittest discover -s tests -v
++```
++
++Test dùng Git thật trong repo tạm, executable Ansible giả để ghi argv/cwd, và
++Bot API giả trong bộ nhớ. Bao gồm nhánh Yes/No, các role, chuyển role, nút cũ,
++người khác bấm nút, quyền Telegram, khóa chạy chung, diff ngoài dự kiến,
++thay đổi sau preview, startup branch và regression của `/run`.
++Không kết nối Telegram/GitLab thật hoặc chạy playbook infra thật trong kiểm thử.
++Việc áp dụng quyền lên GitLab còn cần kiểm tra tại container của bạn.
+diff --git a/README.md b/README.md
+index b3dd724..d748c9e 100644
+--- a/README.md
++++ b/README.md
+@@ -1,6 +1,12 @@
+ # Ansible Telegram bot
+ 
+-Bot này chạy đúng lệnh dưới đây từ thư mục gốc của source
++Bot hỗ trợ `/gitlab` để nhập namespace/service/user, chọn role và xác nhận
++Yes/No trước khi cập nhật `group_vars/gitlab-ghub` trên branch `master`.
++Bot gửi toàn bộ Git status/diff và chạy
++`ansible-playbook -i nonprod gitlab-repos-ghub.yaml --tags=<namespace>,project_user_access`
++khi kiểm tra hợp lệ. Xem [hướng dẫn luồng /gitlab](GITLAB-FLOW.md).
++
++Luồng `/run <source-branch>` chạy lệnh dưới đây từ thư mục gốc của source
+ `gitlab.g-pay.vn/devops/ansible/infra`, sau đó tạo GitLab Merge Request khi
+ Ansible thành công:
+ 
+@@ -8,11 +14,11 @@ Ansible thành công:
+ ansible-playbook -i nonprod gitlab-repos.yaml --tags=project_user_access
+ ```
+ 
+-Telegram hỗ trợ `/run <source-branch>`, `/start` và `/help`.
++Telegram hỗ trợ `/gitlab`, `/cancel`, `/run <source-branch>`, `/start` và `/help`.
+ Source branch **phải được commit/push từ trước**
+ và có diff so với `GIT_TARGET_BRANCH`. Chạy một playbook hiện có không tự tạo
+-diff cho MR; vì chưa biết định dạng biến `project_user_access` trong repo Ansible,
+-bot không tự sửa playbook/inventory. GitLab repo không truy cập được trong môi
++diff cho MR. `/run` dùng source đã commit; `/gitlab` sửa membership trong file
++`group_vars/gitlab-ghub` theo cấu trúc đã cung cấp. GitLab repo không truy cập được trong môi
+ trường thiết kế này, do đó cần kiểm tra inventory `nonprod`, vị trí playbook
+ và các dependency role/collection tại môi trường của bạn.
+ 
+@@ -73,7 +79,8 @@ token/credential. Exit 128 chưa đủ để xác định lỗi xác thực: log
+ biệt `Authentication failed`, lỗi certificate, DNS/network hoặc branch không tồn tại.
+ 
+ Nếu checkout đã tồn tại, bot kiểm tra origin và working tree, fetch branch rồi
+-checkout detached commit mới nhất của `origin/GIT_TARGET_BRANCH`. Nếu thư mục có
++checkout branch `GIT_TARGET_BRANCH`, cập nhật bằng merge `--ff-only` từ
++`origin/GIT_TARGET_BRANCH`. Nếu thư mục có
+ dữ liệu khác, origin không khớp hoặc có thay đổi local, bot dừng khởi động và giữ
+ nguyên dữ liệu. Clone/fetch lỗi hoặc vượt timeout cũng dừng khởi động.
+ 
+@@ -149,9 +156,9 @@ hiện thủ công trên cùng commit và cùng môi trường; bot chỉ trả
+ python -m unittest discover -s tests -v
+ ```
+ 
+-Test dùng repo Git local và executable Ansible giả để xác nhận đúng argv,
+-chỉ tạo MR sau exit 0, và từ chối branch không có diff. Test startup kiểm tra
+-clone/cập nhật checkout, giữ dữ liệu local, credential helper qua Git thật,
+-clone/fetch qua HTTPS có Basic authentication trên server local, che token trong
+-lỗi xác thực/timeout, lỗi CA và HTTP 200/404. Test không kết nối GitLab/Telegram thật hay
+-Ansible server thật.
++Test dùng repo Git local và executable Ansible giả để xác nhận đúng argv/cwd,
++chỉ tạo MR của `/run` sau exit 0, và từ chối branch không có diff. Test `/gitlab`
++kiểm tra hội thoại, Yes/No, role, diff, thay đổi đồng thời và khóa chạy chung.
++Test startup kiểm tra branch master, cập nhật fast-forward và giữ commit khi
++branch phân kỳ. Bot API giả chạy trong bộ nhớ; test không kết nối
++GitLab/Telegram thật hay Ansible server thật.
+diff --git a/bot.py b/bot.py
+index aa8a163..f7c9e7e 100644
+--- a/bot.py
++++ b/bot.py
+@@ -14,6 +14,8 @@ from telegram import Update
+ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+ 
+ from config import Settings, load_env_file
++from gitlab_access import GitLabAccessWorkflow
++from gitlab_conversation import create_gitlab_conversation
+ from runtime import prepare_repository, start_health_server
+ from workflow import Pipeline, WorkflowError
+ 
+@@ -38,6 +40,8 @@ def build_application(settings):
+     async def help_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+         if await authorized(update):
+             await update.effective_message.reply_text(
++                "Dùng /gitlab để chọn namespace/service/user/role và cập nhật quyền Ghub. "
++                "Dùng /cancel để dừng trước khi xác nhận.\n"
+                 "Dùng /run <source-branch> để chạy playbook GitLab trên branch đã commit "
+                 "và tạo GitLab MR nếu Ansible thành công."
+             )
+@@ -72,6 +76,8 @@ def build_application(settings):
+             )
+ 
+     app = ApplicationBuilder().token(settings.telegram_token).concurrent_updates(False).build()
++    for handler in create_gitlab_conversation(GitLabAccessWorkflow(settings), run_lock, authorized):
++        app.add_handler(handler)
+     app.add_handler(CommandHandler("start", help_command))
+     app.add_handler(CommandHandler("help", help_command))
+     app.add_handler(CommandHandler("run", run_command))
+diff --git a/gitlab_access.py b/gitlab_access.py
+new file mode 100644
+index 0000000..c3e447d
+--- /dev/null
++++ b/gitlab_access.py
+@@ -0,0 +1,341 @@
++"""Edit one GitLab service's users_access and run the requested Ghub playbook."""
++
++import copy
++import json
++import os
++import re
++import stat
++import tempfile
++from dataclasses import dataclass
++from pathlib import Path
++
++import yaml
++from yaml.nodes import MappingNode, SequenceNode
++from yaml.tokens import AliasToken
++
++from git_auth import redact_git_output
++from workflow import WorkflowError, _command, _git, _recap, git_command
++
++
++ACCESS_FILE = "group_vars/gitlab-ghub"
++PLAYBOOK = "gitlab-repos-ghub.yaml"
++INVENTORY = "nonprod"
++REQUIRED_BRANCH = "master"
++ROLES = ("maintainer", "developer", "reporter", "guest")
++SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$")
++USERNAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,254}$")
++
++
++class UniqueKeyLoader(yaml.SafeLoader):
++    def construct_mapping(self, node, deep=False):
++        self.flatten_mapping(node)
++        result = {}
++        for key_node, value_node in node.value:
++            key = self.construct_object(key_node, deep=deep)
++            if not isinstance(key, str) or key in result:
++                raise WorkflowError("YAML có key không hợp lệ hoặc bị trùng.")
++            result[key] = self.construct_object(value_node, deep=deep)
++        return result
++
++
++@dataclass(frozen=True)
++class AccessRequest:
++    namespace: str
++    service: str
++    username: str
++    role: str
++    current_roles: tuple
++    head: str
++    source: bytes
++
++
++@dataclass(frozen=True)
++class GitReport:
++    status: str
++    diff: str
++    porcelain: str
++    branch: str
++    head: str
++
++
++class GitCheckError(WorkflowError):
++    def __init__(self, message, report):
++        super().__init__(message)
++        self.report = report
++
++
++@dataclass(frozen=True)
++class AppliedChange:
++    request: AccessRequest
++    content: bytes
++    report: GitReport
++
++
++@dataclass(frozen=True)
++class AccessResult:
++    command: tuple
++    recap: str
++
++
++def _node_value(node, key):
++    if not isinstance(node, MappingNode):
++        raise WorkflowError("Cấu trúc YAML không hợp lệ.")
++    for key_node, value in node.value:
++        if key_node.value == key:
++            return value
++    raise WorkflowError("YAML thiếu key %s." % key)
++
++
++def _load(source):
++    try:
++        text = source.decode("utf-8")
++        # An alias could make a change to one list affect several services.
++        if any(isinstance(token, AliasToken) for token in yaml.scan(text)):
++            raise WorkflowError("Không tự sửa YAML có alias; cần danh sách users riêng cho từng role.")
++        document = yaml.load(text, Loader=UniqueKeyLoader)
++        nodes = yaml.compose(text, Loader=UniqueKeyLoader)
++    except (UnicodeError, yaml.YAMLError) as exc:
++        raise WorkflowError("Không đọc được YAML trong %s." % ACCESS_FILE) from exc
++    if not isinstance(document, dict):
++        raise WorkflowError("File %s phải chứa một YAML mapping." % ACCESS_FILE)
++    return text, document, nodes
++
++
++def _namespace(document, namespace):
++    if not SLUG.fullmatch(namespace):
++        raise WorkflowError("Tên namespace không hợp lệ.")
++    groups = document.get("gitlab_groups")
++    projects = document.get("gitlab_projects")
++    if not isinstance(groups, list) or not isinstance(projects, dict):
++        raise WorkflowError("YAML thiếu gitlab_groups hoặc gitlab_projects.")
++    matches = [group for group in groups if isinstance(group, dict) and group.get("path") == namespace]
++    if len(matches) != 1 or namespace not in projects:
++        raise WorkflowError("Namespace %s không tồn tại duy nhất trong gitlab_groups/gitlab_projects." % namespace)
++    group = matches[0]
++    parent = group.get("parent")
++    entry = projects[namespace]
++    if not isinstance(parent, str) or not parent or not isinstance(entry, dict):
++        raise WorkflowError("Cấu hình namespace %s không hợp lệ." % namespace)
++    services = entry.get("project")
++    if not isinstance(services, list):
++        raise WorkflowError("Namespace %s thiếu danh sách project." % namespace)
++    return parent.rstrip("/") + "/" + namespace, services
++
++
++def _project(document, nodes, namespace, service):
++    if not SLUG.fullmatch(service):
++        raise WorkflowError("Tên service không hợp lệ; nhập phần cuối của project.path.")
++    group_path, services = _namespace(document, namespace)
++    expected_path = group_path + "/" + service
++    matches = [(i, project) for i, project in enumerate(services)
++               if isinstance(project, dict) and project.get("path") == expected_path]
++    if len(matches) != 1:
++        raise WorkflowError("Service %s không tồn tại duy nhất trong namespace %s." % (service, namespace))
++    index, project = matches[0]
++    project_nodes = _node_value(_node_value(_node_value(nodes, "gitlab_projects"), namespace), "project")
++    if not isinstance(project_nodes, SequenceNode):
++        raise WorkflowError("project phải là một YAML list.")
++    return project, project_nodes.value[index]
++
++
++def _access(project, project_node):
++    entries = project.get("users_access")
++    if not isinstance(entries, list):
++        raise WorkflowError("Service thiếu danh sách users_access.")
++    entry_nodes = _node_value(project_node, "users_access")
++    if not isinstance(entry_nodes, SequenceNode):
++        raise WorkflowError("users_access phải là một YAML list.")
++    access = {}
++    for entry, node in zip(entries, entry_nodes.value):
++        if not isinstance(entry, dict):
++            raise WorkflowError("users_access có entry không hợp lệ.")
++        role, users = entry.get("level"), entry.get("users")
++        if role not in ROLES or role in access:
++            raise WorkflowError("users_access có role không hỗ trợ hoặc bị trùng.")
++        if not isinstance(users, list) or any(not isinstance(user, str) for user in users):
++            raise WorkflowError("users của role %s phải là danh sách username." % role)
++        if len(set(users)) != len(users):
++            raise WorkflowError("Danh sách users của role %s có user bị trùng." % role)
++        users_node = _node_value(node, "users")
++        if not isinstance(users_node, SequenceNode) or not users_node.flow_style:
++            raise WorkflowError("users phải dùng dạng inline list: [\"user1\", \"user2\"].")
++        access[role] = (entry, users_node)
++    if set(access) != set(ROLES):
++        raise WorkflowError("users_access phải có đủ maintainer, developer, reporter, guest.")
++    return access
++
++
++def _updated_content(request):
++    text, document, nodes = _load(request.source)
++    project, project_node = _project(document, nodes, request.namespace, request.service)
++    access = _access(project, project_node)
++    expected = copy.deepcopy(document)
++    expected_project, _ = _project(expected, nodes, request.namespace, request.service)
++    expected_access = {entry["level"]: entry for entry in expected_project["users_access"]}
++    replacements = []
++    for role, (entry, node) in access.items():
++        users = entry["users"]
++        if role == request.role:
++            updated = list(users) if request.username in users else users + [request.username]
++        else:
++            updated = [user for user in users if user != request.username]
++        expected_access[role]["users"] = updated
++        if updated != users:
++            replacements.append((node.start_mark.index, node.end_mark.index,
++                                 json.dumps(updated, ensure_ascii=False)))
++    # Replace only the selected service's user lists; retain every other byte.
++    for start, end, replacement in sorted(replacements, reverse=True):
++        text = text[:start] + replacement + text[end:]
++    content = text.encode("utf-8")
++    if _load(content)[1] != expected:
++        raise WorkflowError("Bản sửa YAML có thay đổi ngoài user/role đã chọn; dừng luồng.")
++    return content
++
++
++def _atomic_write(path, content):
++    temporary = None
++    try:
++        mode = stat.S_IMODE(path.stat().st_mode)
++        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".gitlab-access-", delete=False) as handle:
++            temporary = Path(handle.name)
++            os.chmod(temporary, mode)
++            handle.write(content)
++            handle.flush()
++            os.fsync(handle.fileno())
++        os.replace(temporary, path)
++    finally:
++        if temporary is not None and temporary.exists():
++            temporary.unlink()
++
++
++class GitLabAccessWorkflow:
++    def __init__(self, settings):
++        self.settings = settings
++        self.repo = Path(settings.git_clone_dir).resolve()
++        self.path = self.repo / ACCESS_FILE
++
++    def _git_output(self, *args):
++        code, output = git_command(self.settings, [
++            "-C", str(self.repo), "-c", "color.ui=false", "--no-pager", *args,
++        ])
++        output = redact_git_output(output, self.settings.gitlab_token)
++        if code:
++            raise WorkflowError("Git thất bại (exit %s).\n%s" % (code, output[-3000:]))
++        return output
++
++    def _require_files(self):
++        root = _git(self.repo, "rev-parse", "--show-toplevel", settings=self.settings)
++        if Path(root).resolve() != self.repo:
++            raise WorkflowError("GIT_CLONE_DIR phải là thư mục gốc của repo Ansible.")
++        for name in (ACCESS_FILE, INVENTORY, PLAYBOOK):
++            path = self.repo / name
++            if not path.is_file() or path.is_symlink() or path.resolve() != path:
++                raise WorkflowError("Repo thiếu file thường %s." % name)
++
++    def report(self):
++        return GitReport(
++            status=self._git_output("status", "--untracked-files=all"),
++            diff=self._git_output("diff", "--no-ext-diff", "--no-textconv", "--", ACCESS_FILE),
++            porcelain=self._git_output("status", "--porcelain=v1", "-z", "--untracked-files=all"),
++            branch=_git(self.repo, "rev-parse", "--abbrev-ref", "HEAD", settings=self.settings),
++            head=_git(self.repo, "rev-parse", "HEAD", settings=self.settings),
++        )
++
++    def _require_clean(self):
++        self._require_files()
++        report = self.report()
++        if report.branch != REQUIRED_BRANCH or report.porcelain:
++            raise GitCheckError(
++                "Repo phải ở branch master và sạch trước lượt /gitlab. Xử lý diff hiện tại rồi thử lại.", report,
++            )
++        return report
++
++    def namespaces(self):
++        self._require_files()
++        _, document, _ = _load(self.path.read_bytes())
++        groups = document.get("gitlab_groups")
++        if not isinstance(groups, list):
++            raise WorkflowError("YAML thiếu danh sách gitlab_groups.")
++        return tuple(group["path"] for group in groups
++                     if isinstance(group, dict) and isinstance(group.get("path"), str))
++
++    def services(self, namespace):
++        self._require_files()
++        _, document, _ = _load(self.path.read_bytes())
++        group_path, projects = _namespace(document, namespace)
++        return tuple(project["path"].rsplit("/", 1)[1] for project in projects
++                     if isinstance(project, dict) and isinstance(project.get("path"), str)
++                     and project["path"].rsplit("/", 1)[0] == group_path)
++
++    def preview(self, namespace, service, username, role):
++        if not USERNAME.fullmatch(username):
++            raise WorkflowError("Tên user không hợp lệ; nhập username GitLab, ví dụ tuanpv.")
++        if role not in ROLES:
++            raise WorkflowError("Role không hợp lệ.")
++        report = self._require_clean()
++        source = self.path.read_bytes()
++        _, document, nodes = _load(source)
++        project, project_node = _project(document, nodes, namespace, service)
++        access = _access(project, project_node)
++        roles = tuple(level for level in ROLES if username in access[level][0]["users"])
++        return AccessRequest(namespace, service, username, role, roles, report.head, source)
++
++    def rollback(self, change):
++        # Do not overwrite someone else's subsequent edit, or reset other files.
++        try:
++            if not self.path.is_symlink() and self.path.read_bytes() == change.content:
++                _atomic_write(self.path, change.request.source)
++                return True
++        except FileNotFoundError:
++            # A file removed by someone else must stay removed.
++            return False
++        return False
++
++    def _validate_change(self, change, report):
++        if report.branch != REQUIRED_BRANCH or report.head != change.request.head:
++            raise GitCheckError("Branch/commit đã đổi; dừng trước khi chạy Ansible.", report)
++        if report.porcelain != " M " + ACCESS_FILE + "\x00":
++            raise GitCheckError("Git status có thay đổi ngoài file dự kiến hoặc có thay đổi staged; dừng luồng.", report)
++        if not report.diff.strip() or self.path.is_symlink() or self.path.read_bytes() != change.content:
++            raise GitCheckError("Git diff không khớp đúng user/role đã xác nhận; dừng luồng.", report)
++
++    def prepare(self, request):
++        report = self._require_clean()
++        if report.head != request.head or self.path.read_bytes() != request.source:
++            raise GitCheckError("Cấu hình đã đổi sau khi chọn role; chạy /gitlab lại để xác nhận thông tin mới.", report)
++        content = _updated_content(request)
++        if content == request.source:
++            raise GitCheckError("User %s đã có role %s; không có diff để chạy Ansible." % (request.username, request.role), report)
++        change = AppliedChange(request, content, report)
++        _atomic_write(self.path, content)
++        try:
++            report = self.report()
++            self._validate_change(change, report)
++        except Exception:
++            self.rollback(change)
++            raise
++        return AppliedChange(request, content, report)
++
++    def run_playbook(self, change):
++        # Recheck after sending the complete Git outputs to Telegram.
++        try:
++            self._require_files()
++            self._validate_change(change, self.report())
++        except Exception:
++            self.rollback(change)
++            raise
++        args = (
++            self.settings.ansible_binary, "-i", INVENTORY, PLAYBOOK,
++            "--tags=" + change.request.namespace + ",project_user_access",
++        )
++        env = os.environ.copy()
++        env["ANSIBLE_NOCOLOR"] = "1"
++        try:
++            code, output = _command(args, cwd=self.repo,
++                                    timeout=self.settings.ansible_timeout_seconds, env=env)
++        except WorkflowError as exc:
++            raise WorkflowError("%s\nGiữ diff YAML để kiểm tra; Ansible có thể đã áp dụng một phần." % exc) from exc
++        if code:
++            detail = redact_git_output(_recap(output) or output[-3000:], self.settings.gitlab_token)
++            raise WorkflowError("Ansible thất bại (exit %s).\n%s\nGiữ diff YAML để kiểm tra; Ansible có thể đã áp dụng một phần." % (code, detail))
++        return AccessResult(args, _recap(output))
+diff --git a/gitlab_conversation.py b/gitlab_conversation.py
+new file mode 100644
+index 0000000..7747a86
+--- /dev/null
++++ b/gitlab_conversation.py
+@@ -0,0 +1,241 @@
++"""Telegram /gitlab conversation, isolated by chat, user and keyboard nonce."""
++
++import asyncio
++from functools import partial
++import logging
++import secrets
++
++from telegram import InlineKeyboardButton, InlineKeyboardMarkup
++from telegram.error import TelegramError
++from telegram.ext import CallbackQueryHandler, CommandHandler, ConversationHandler, MessageHandler, filters
++
++from gitlab_access import GitCheckError, ROLES, USERNAME
++from workflow import WorkflowError
++
++
++NAMESPACE, SERVICE, USER, ROLE, CONFIRM = range(5)
++SESSION_KEY = "gitlab_access"
++
++
++def telegram_chunks(text, limit=3500):
++    """Yield all text, respecting Telegram's UTF-16 length limit."""
++    while text:
++        size = 0
++        end = 0
++        for character in text:
++            units = 2 if ord(character) > 0xFFFF else 1
++            if size + units > limit:
++                break
++            size += units
++            end += 1
++        if end < len(text):
++            newline = text.rfind("\n", 0, end)
++            if newline >= 0:
++                end = newline + 1
++        yield text[:end]
++        text = text[end:]
++
++
++async def reply_full(message, text):
++    for chunk in telegram_chunks(text):
++        await message.reply_text(chunk, parse_mode=None)
++
++
++async def reply_git_report(message, report):
++    await reply_full(message, "$ git status\n" + report.status)
++    await reply_full(message, "$ git diff group_vars/gitlab-ghub\n" + (report.diff or "(không có diff)"))
++
++
++def create_gitlab_conversation(workflow, run_lock, authorized):
++    async def backend(function, *args):
++        return await asyncio.get_running_loop().run_in_executor(None, partial(function, *args))
++
++    async def clear_session(ctx):
++        session = ctx.user_data.pop(SESSION_KEY, None)
++        if session and session.get("menu_id"):
++            try:
++                await ctx.bot.edit_message_reply_markup(
++                    chat_id=session["chat_id"], message_id=session["menu_id"], reply_markup=None,
++                )
++            except TelegramError:
++                pass
++
++    async def start(update, ctx):
++        if not await authorized(update):
++            return ConversationHandler.END
++        await clear_session(ctx)
++        if run_lock.locked():
++            await update.effective_message.reply_text("Đang có một lượt Ansible chạy; thử lại sau.")
++            return ConversationHandler.END
++        ctx.user_data[SESSION_KEY] = {
++            "nonce": secrets.token_hex(6), "chat_id": update.effective_chat.id,
++        }
++        await update.effective_message.reply_text("Nhập tên namespace")
++        return NAMESPACE
++
++    async def namespace_input(update, ctx):
++        if not await authorized(update):
++            return ConversationHandler.END
++        namespace = update.effective_message.text.strip()
++        try:
++            services = await backend(workflow.services, namespace)
++            if not services:
++                raise WorkflowError("Namespace %s chưa có service." % namespace)
++        except WorkflowError as exc:
++            await reply_full(update.effective_message, "❌ %s\nNhập tên namespace" % exc)
++            return NAMESPACE
++        ctx.user_data[SESSION_KEY].update(namespace=namespace, services=services)
++        await update.effective_message.reply_text("Nhập tên service")
++        return SERVICE
++
++    async def service_input(update, ctx):
++        if not await authorized(update):
++            return ConversationHandler.END
++        session = ctx.user_data[SESSION_KEY]
++        service = update.effective_message.text.strip()
++        if service not in session["services"]:
++            await reply_full(update.effective_message,
++                             "❌ Service không tồn tại trong namespace %s.\nDanh sách: %s\nNhập tên service"
++                             % (session["namespace"], ", ".join(session["services"])))
++            return SERVICE
++        session["service"] = service
++        await update.effective_message.reply_text("Nhập tên user")
++        return USER
++
++    async def user_input(update, ctx):
++        if not await authorized(update):
++            return ConversationHandler.END
++        username = update.effective_message.text.strip()
++        if not USERNAME.fullmatch(username):
++            await update.effective_message.reply_text("Tên user không hợp lệ. Nhập username GitLab, ví dụ tuanpv.")
++            return USER
++        session = ctx.user_data[SESSION_KEY]
++        session["username"] = username
++        keyboard = InlineKeyboardMarkup([
++            [InlineKeyboardButton(role, callback_data="gitlab:%s:role:%s" % (session["nonce"], role))]
++            for role in ROLES
++        ])
++        message = await update.effective_message.reply_text("Chọn role", reply_markup=keyboard)
++        session["menu_id"] = message.message_id
++        return ROLE
++
++    async def callback_session(update, ctx):
++        query = update.callback_query
++        if not await authorized(update):
++            await query.answer("Bạn không có quyền dùng bot này.", show_alert=True)
++            return None
++        session = ctx.user_data.get(SESSION_KEY)
++        parts = query.data.split(":")
++        if (not session or len(parts) != 4 or parts[1] != session["nonce"]
++                or query.message.message_id != session.get("menu_id")):
++            await query.answer("Lựa chọn đã hết hạn hoặc thuộc người khác.", show_alert=True)
++            return None
++        await query.answer()
++        return session
++
++    async def role_input(update, ctx):
++        session = await callback_session(update, ctx)
++        if session is None:
++            return ROLE
++        role = update.callback_query.data.rsplit(":", 1)[1]
++        await update.callback_query.edit_message_text("Đã chọn role: " + role)
++        try:
++            request = await backend(workflow.preview, session["namespace"], session["service"],
++                                    session["username"], role)
++        except WorkflowError as exc:
++            if isinstance(exc, GitCheckError):
++                await reply_git_report(update.effective_message, exc.report)
++            await reply_full(update.effective_message, "❌ " + str(exc))
++            await clear_session(ctx)
++            return ConversationHandler.END
++        session["request"] = request
++        status = ("user %s đang có role %s" % (request.username, ", ".join(request.current_roles))
++                  if request.current_roles else "user %s chưa có role" % request.username)
++        keyboard = InlineKeyboardMarkup([[
++            InlineKeyboardButton("Yes", callback_data="gitlab:%s:confirm:yes" % session["nonce"]),
++            InlineKeyboardButton("No", callback_data="gitlab:%s:confirm:no" % session["nonce"]),
++        ]])
++        message = await update.effective_message.reply_text(
++            "%s\nNamespace: %s\nService: %s\nRole được chọn: %s\n\nBạn có muốn thực hiện thay đổi?"
++            % (status, request.namespace, request.service, request.role), reply_markup=keyboard,
++        )
++        session["menu_id"] = message.message_id
++        return CONFIRM
++
++    async def apply_request(message, request):
++        if run_lock.locked():
++            await message.reply_text("Đang có một lượt Ansible chạy; thử lại bằng /gitlab sau.")
++            return
++        async with run_lock:
++            change = None
++            playbook_started = False
++            try:
++                change = await backend(workflow.prepare, request)
++                await reply_git_report(message, change.report)
++                await message.reply_text(
++                    "Kiểm tra Git hợp lệ. Đang chạy:\nansible-playbook -i nonprod gitlab-repos-ghub.yaml --tags=%s,project_user_access"
++                    % request.namespace,
++                )
++                playbook_started = True
++                result = await backend(workflow.run_playbook, change)
++            except GitCheckError as exc:
++                await reply_git_report(message, exc.report)
++                await reply_full(message, "❌ " + str(exc))
++                return
++            except WorkflowError as exc:
++                await reply_full(message, "❌ " + str(exc))
++                return
++            except Exception:
++                logging.exception("Unexpected /gitlab failure")
++                if change is not None and not playbook_started:
++                    await backend(workflow.rollback, change)
++                await message.reply_text("❌ Lỗi nội bộ; kiểm tra log bot.")
++                return
++            await reply_full(message, "✅ Ansible thành công.\n%s/%s: user %s → %s\n%s\nDiff YAML được giữ để commit."
++                             % (request.namespace, request.service, request.username, request.role, result.recap))
++
++    async def confirmation_input(update, ctx):
++        session = await callback_session(update, ctx)
++        if session is None:
++            return CONFIRM
++        answer = update.callback_query.data.rsplit(":", 1)[1]
++        request = session["request"]
++        await update.callback_query.edit_message_reply_markup(reply_markup=None)
++        ctx.user_data.pop(SESSION_KEY, None)
++        if answer == "no":
++            await update.effective_message.reply_text("Đã dừng luồng.")
++        else:
++            await update.effective_message.reply_text("Đã xác nhận. Đang cập nhật cấu hình...")
++            # Keep polling responsive; the shared lock prevents overlapping runs.
++            ctx.application.create_task(apply_request(update.effective_message, request), update=update)
++        return ConversationHandler.END
++
++    async def cancel(update, ctx):
++        if await authorized(update):
++            await clear_session(ctx)
++            await update.effective_message.reply_text("Đã dừng luồng.")
++        return ConversationHandler.END
++
++    async def use_buttons(update, ctx):
++        if await authorized(update):
++            await update.effective_message.reply_text("Bấm nút role hoặc Yes/No ở tin nhắn của bot; dùng /cancel để dừng.")
++
++    async def stale_callback(update, ctx):
++        await update.callback_query.answer("Lựa chọn đã hết hạn hoặc thuộc người khác. Chạy /gitlab để bắt đầu.", show_alert=True)
++
++    text = filters.TEXT & ~filters.COMMAND
++    conversation = ConversationHandler(
++        entry_points=[CommandHandler("gitlab", start)],
++        states={
++            NAMESPACE: [MessageHandler(text, namespace_input)],
++            SERVICE: [MessageHandler(text, service_input)],
++            USER: [MessageHandler(text, user_input)],
++            ROLE: [CallbackQueryHandler(role_input, pattern=r"^gitlab:[0-9a-f]{12}:role:(maintainer|developer|reporter|guest)$"),
++                   MessageHandler(text, use_buttons)],
++            CONFIRM: [CallbackQueryHandler(confirmation_input, pattern=r"^gitlab:[0-9a-f]{12}:confirm:(yes|no)$"),
++                      MessageHandler(text, use_buttons)],
++        },
++        fallbacks=[CommandHandler("cancel", cancel)],
++        allow_reentry=True, per_chat=True, per_user=True, per_message=False,
++    )
++    return conversation, CallbackQueryHandler(stale_callback, pattern=r"^gitlab:")
+diff --git a/requirements.txt b/requirements.txt
+index 69dbd16..2b56143 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,4 +1,5 @@
+ python-telegram-bot==20.7
++PyYAML==6.0.1
+ ansible-core==2.12.10
+ Jinja2==2.10.1
+ # Jinja2 2.10.1 imports soft_unicode, removed from MarkupSafe 2.1+.
+diff --git a/runtime.py b/runtime.py
+index 52bf2bb..39e4889 100644
+--- a/runtime.py
++++ b/runtime.py
+@@ -65,7 +65,10 @@ def prepare_repository(settings):
+             "+refs/heads/%s:%s" % (settings.git_target_branch, remote_ref),
+             settings=settings, timeout=timeout,
+         )
+-        _git(repo, "checkout", "--detach", remote_ref, settings=settings)
++        # /gitlab requires a named master branch, including after a restart.
++        # Fast-forward only: retain local commits instead of resetting a branch.
++        _git(repo, "checkout", settings.git_target_branch, settings=settings)
++        _git(repo, "merge", "--ff-only", remote_ref, settings=settings)
+ 
+     commit = _git(repo, "rev-parse", "--verify", "HEAD^{commit}", settings=settings)
+     logging.info("Ansible repository ready at %s (commit %s)", repo, commit[:12])
+diff --git a/tests/test_gitlab_access.py b/tests/test_gitlab_access.py
+new file mode 100644
+index 0000000..b753ea8
+--- /dev/null
++++ b/tests/test_gitlab_access.py
+@@ -0,0 +1,325 @@
++import json
++import os
++import subprocess
++import sys
++import tempfile
++import unittest
++from dataclasses import replace
++from pathlib import Path
++from unittest.mock import patch
++
++import yaml
++
++from config import Settings
++from gitlab_access import ACCESS_FILE, GitCheckError, GitLabAccessWorkflow
++from runtime import prepare_repository
++from workflow import WorkflowError
++
++
++FIXTURE = '''---
++gitlab_groups:
++  - path: ghub-website
++    parent: development
++  - path: ghub-connector
++    parent: development
++gitlab_projects:
++  ghub-website:
++    project:
++      # Giữ nguyên comment, dấu nháy và thứ tự.
++      - name: "Merchant Portal API"
++        path: "development/ghub-website/merchant-portal-client"
++        enable_ci_hook: true
++        description: "Ghub Merchant Portal Client"
++        users_access:
++          - level: maintainer
++            users: ["tracth"]
++          - level: developer
++            users: ["anhtn", "trung"]
++          - level: reporter
++            users: []
++          - level: guest
++            users: []
++      - name: Other service
++        path: "development/ghub-website/api-gateway"
++        users_access:
++          - level: maintainer
++            users: ["tracth"]
++          - level: developer
++            users: []
++          - level: reporter
++            users: []
++          - level: guest
++            users: []
++  ghub-connector:
++    project:
++      - name: Same service name in another namespace
++        path: "development/ghub-connector/api-gateway"
++        users_access:
++          - level: maintainer
++            users: ["anhtn"]
++          - level: developer
++            users: []
++          - level: reporter
++            users: []
++          - level: guest
++            users: []
++'''
++
++
++def git(repo, *args):
++    return subprocess.run(["git", "-C", str(repo), *args], check=True, text=True,
++                          stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.strip()
++
++
++class RepositoryFixture:
++    def __init__(self):
++        self.temporary = tempfile.TemporaryDirectory()
++        self.root = Path(self.temporary.name)
++        self.repo = self.root / "infra"
++        self.repo.mkdir()
++        git(self.repo, "init", "-b", "master")
++        git(self.repo, "config", "user.name", "Bot Test")
++        git(self.repo, "config", "user.email", "bot@example.org")
++        (self.repo / "group_vars").mkdir()
++        self.path = self.repo / ACCESS_FILE
++        self.path.write_text(FIXTURE, encoding="utf-8")
++        (self.repo / "nonprod").write_text("[gitlab]\nlocalhost ansible_connection=local\n")
++        (self.repo / "gitlab-repos-ghub.yaml").write_text("---\n- hosts: gitlab\n  tasks: []\n")
++        self.commit()
++        self.marker = self.root / "ansible.json"
++        self.executable = self.root / "fake-ansible"
++        self.executable.write_text(
++            "#!%s\nimport json, os, sys\n" % sys.executable
++            + "with open(%r, 'w') as output:\n" % str(self.marker)
++            + "    json.dump({'args': sys.argv[1:], 'cwd': os.getcwd()}, output)\n"
++            + "print('PLAY RECAP ' + '*' * 50)\n"
++            + "print('gitlab : ok=1 changed=1 unreachable=0 failed=0')\n"
++            + "sys.exit(int(os.getenv('ANSIBLE_TEST_EXIT', '0')))\n"
++        )
++        self.executable.chmod(0o755)
++        self.settings = Settings(
++            telegram_token="123:fake", allowed_group_id=-1001,
++            allowed_user_ids=frozenset({42, 43}), git_repo_url=str(self.root / "remote.git"),
++            git_target_branch="master", gitlab_url="https://gitlab.example",
++            gitlab_project_id="devops/ansible/infra", gitlab_token="token-placeholder",
++            git_clone_dir=str(self.repo), ansible_binary=str(self.executable),
++        )
++        self.workflow = GitLabAccessWorkflow(self.settings)
++
++    def commit(self):
++        git(self.repo, "add", ".")
++        git(self.repo, "commit", "-m", "fixture")
++
++    def request(self, user="tuanpv", role="developer", namespace="ghub-website", service="merchant-portal-client"):
++        return self.workflow.preview(namespace, service, user, role)
++
++    def close(self):
++        self.temporary.cleanup()
++
++
++class AccessTests(unittest.TestCase):
++    def setUp(self):
++        self.fixture = RepositoryFixture()
++        self.addCleanup(self.fixture.close)
++        self.workflow = self.fixture.workflow
++        self.path = self.fixture.path
++
++    def test_preview_reports_current_role_without_editing(self):
++        before = self.path.read_bytes()
++        self.assertEqual(self.fixture.request("anhtn").current_roles, ("developer",))
++        self.assertEqual(self.fixture.request().current_roles, ())
++        self.assertEqual(before, self.path.read_bytes())
++        self.assertFalse(self.fixture.marker.exists())
++
++    def test_add_user_has_exact_diff_and_runs_exact_argv_and_cwd(self):
++        before = self.path.read_bytes()
++        change = self.workflow.prepare(self.fixture.request())
++        expected = before.replace(b'users: ["anhtn", "trung"]', b'users: ["anhtn", "trung", "tuanpv"]', 1)
++        self.assertEqual(self.path.read_bytes(), expected)
++        self.assertIn('-            users: ["anhtn", "trung"]', change.report.diff)
++        self.assertIn('+            users: ["anhtn", "trung", "tuanpv"]', change.report.diff)
++        self.assertEqual(change.report.porcelain, " M group_vars/gitlab-ghub\x00")
++        self.assertIn("On branch master", change.report.status)
++        self.assertFalse(self.fixture.marker.exists())
++        result = self.workflow.run_playbook(change)
++        invocation = json.loads(self.fixture.marker.read_text())
++        self.assertEqual(invocation, {"args": ["-i", "nonprod", "gitlab-repos-ghub.yaml",
++                                               "--tags=ghub-website,project_user_access"],
++                                      "cwd": str(self.fixture.repo)})
++        self.assertIn("PLAY RECAP", result.recap)
++        self.assertEqual(self.path.read_bytes(), expected)
++
++    def test_move_role_only_in_selected_service(self):
++        change = self.workflow.prepare(self.fixture.request("tracth", "developer"))
++        data = yaml.safe_load(change.content)
++        services = data["gitlab_projects"]["ghub-website"]["project"]
++        self.assertEqual(services[0]["users_access"][0]["users"], [])
++        self.assertEqual(services[0]["users_access"][1]["users"], ["anhtn", "trung", "tracth"])
++        self.assertEqual(services[1]["users_access"][0]["users"], ["tracth"])
++
++    def test_same_service_name_in_other_namespace_is_not_modified(self):
++        before = yaml.safe_load(self.path.read_bytes())
++        change = self.workflow.prepare(self.fixture.request(service="api-gateway"))
++        after = yaml.safe_load(change.content)
++        self.assertEqual(after["gitlab_projects"]["ghub-connector"], before["gitlab_projects"]["ghub-connector"])
++        self.assertEqual(after["gitlab_projects"]["ghub-website"]["project"][0],
++                         before["gitlab_projects"]["ghub-website"]["project"][0])
++
++    def test_same_role_has_no_diff_and_does_not_run_ansible(self):
++        with self.assertRaisesRegex(GitCheckError, "không có diff") as caught:
++            self.workflow.prepare(self.fixture.request("anhtn", "developer"))
++        self.assertEqual(caught.exception.report.diff, "")
++        self.assertFalse(self.fixture.marker.exists())
++
++    def test_all_four_roles_can_be_selected(self):
++        for role in ("maintainer", "developer", "reporter", "guest"):
++            with self.subTest(role=role):
++                request = self.fixture.request(role=role)
++                change = self.workflow.prepare(request)
++                data = yaml.safe_load(change.content)
++                entries = data["gitlab_projects"]["ghub-website"]["project"][0]["users_access"]
++                self.assertEqual([entry["level"] for entry in entries if "tuanpv" in entry["users"]], [role])
++                self.assertTrue(self.workflow.rollback(change))
++
++    def test_wrong_branch_and_detached_head_are_rejected(self):
++        for args in (("checkout", "-b", "feature/test"), ("checkout", "--detach", "master")):
++            with self.subTest(args=args):
++                git(self.fixture.repo, *args)
++                with self.assertRaisesRegex(GitCheckError, "branch master"):
++                    self.fixture.request()
++        self.assertEqual(self.path.read_text(), FIXTURE)
++        self.assertFalse(self.fixture.marker.exists())
++
++    def test_dirty_worktree_or_index_is_rejected_before_editing(self):
++        other = self.fixture.repo / "unexpected.txt"
++        other.write_text("keep me\n")
++        with self.assertRaises(GitCheckError) as caught:
++            self.fixture.request()
++        self.assertIn("unexpected.txt", caught.exception.report.status)
++        other.unlink()
++        self.path.write_text(FIXTURE + "# change\n")
++        git(self.fixture.repo, "add", ACCESS_FILE)
++        with self.assertRaises(GitCheckError):
++            self.fixture.request()
++        self.assertIn("# change", self.path.read_text())
++        self.assertFalse(self.fixture.marker.exists())
++
++    def test_committed_update_after_confirmation_preview_is_rejected(self):
++        request = self.fixture.request()
++        self.path.write_text(FIXTURE + "# new committed config\n")
++        self.fixture.commit()
++        with self.assertRaisesRegex(GitCheckError, "đã đổi"):
++            self.workflow.prepare(request)
++        self.assertIn("# new committed config", self.path.read_text())
++        self.assertFalse(self.fixture.marker.exists())
++
++    def test_unexpected_file_after_edit_restores_only_own_yaml_change(self):
++        request = self.fixture.request()
++        original_report = self.workflow.report
++        count = 0
++
++        def report_with_external_change():
++            nonlocal count
++            count += 1
++            if count == 2:
++                (self.fixture.repo / "unexpected.txt").write_text("external edit")
++            return original_report()
++
++        with patch.object(self.workflow, "report", side_effect=report_with_external_change):
++            with self.assertRaisesRegex(GitCheckError, "ngoài file") as caught:
++                self.workflow.prepare(request)
++        self.assertIn("unexpected.txt", caught.exception.report.status)
++        self.assertEqual(self.path.read_text(), FIXTURE)
++        self.assertEqual((self.fixture.repo / "unexpected.txt").read_text(), "external edit")
++        self.assertFalse(self.fixture.marker.exists())
++
++    def test_recheck_before_ansible_stops_when_branch_changes(self):
++        change = self.workflow.prepare(self.fixture.request())
++        git(self.fixture.repo, "checkout", "-b", "feature/external")
++        with self.assertRaisesRegex(GitCheckError, "Branch/commit"):
++            self.workflow.run_playbook(change)
++        self.assertEqual(self.path.read_text(), FIXTURE)
++        self.assertFalse(self.fixture.marker.exists())
++
++    def test_external_yaml_edit_is_retained_and_ansible_does_not_run(self):
++        change = self.workflow.prepare(self.fixture.request())
++        externally_changed = change.content + b"\n# someone else's edit\n"
++        self.path.write_bytes(externally_changed)
++        with self.assertRaisesRegex(GitCheckError, "Git diff"):
++            self.workflow.run_playbook(change)
++        self.assertEqual(self.path.read_bytes(), externally_changed)
++        self.assertFalse(self.fixture.marker.exists())
++
++    def test_failed_ansible_retains_yaml_diff_for_review(self):
++        change = self.workflow.prepare(self.fixture.request())
++        with patch.dict(os.environ, {"ANSIBLE_TEST_EXIT": "2"}):
++            with self.assertRaisesRegex(WorkflowError, "exit 2"):
++                self.workflow.run_playbook(change)
++        self.assertTrue(self.fixture.marker.exists())
++        self.assertEqual(self.path.read_bytes(), change.content)
++
++    def test_invalid_namespace_service_and_username_are_rejected(self):
++        for kwargs in ({"namespace": "ghub-missing"}, {"namespace": "ghub-website,all"},
++                       {"service": "merchant-portal"}, {"user": "name; command"}):
++            with self.subTest(kwargs=kwargs), self.assertRaises(WorkflowError):
++                self.fixture.request(**kwargs)
++        self.assertEqual(self.path.read_text(), FIXTURE)
++
++    def test_duplicate_project_path_is_rejected(self):
++        self.path.write_text(FIXTURE.replace('development/ghub-website/api-gateway',
++                                            'development/ghub-website/merchant-portal-client'))
++        self.fixture.commit()
++        with self.assertRaisesRegex(WorkflowError, "duy nhất"):
++            self.fixture.request()
++
++    def test_duplicate_keys_and_aliases_are_rejected(self):
++        malformed = (FIXTURE + "gitlab_projects: {}\n", FIXTURE + "unused: &list []\nalias: *list\n")
++        for content in malformed:
++            with self.subTest(content=content[-40:]):
++                self.path.write_text(content)
++                self.fixture.commit()
++                with self.assertRaises(WorkflowError):
++                    self.fixture.request()
++
++    def test_startup_returns_existing_detached_checkout_to_master(self):
++        remote = Path(self.fixture.settings.git_repo_url)
++        subprocess.run(["git", "clone", "--bare", str(self.fixture.repo), str(remote)],
++                       check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
++        git(self.fixture.repo, "remote", "add", "origin", str(remote))
++        git(self.fixture.repo, "checkout", "--detach", "HEAD")
++        prepare_repository(self.fixture.settings)
++        self.assertEqual(git(self.fixture.repo, "branch", "--show-current"), "master")
++        self.assertEqual(git(self.fixture.repo, "status", "--porcelain"), "")
++
++    def test_startup_fast_forwards_and_preserves_local_commits_on_divergence(self):
++        remote = Path(self.fixture.settings.git_repo_url)
++        subprocess.run(["git", "clone", "--bare", str(self.fixture.repo), str(remote)],
++                       check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
++        git(self.fixture.repo, "remote", "add", "origin", str(remote))
++        writer = self.fixture.root / "writer"
++        subprocess.run(["git", "clone", str(remote), str(writer)], check=True,
++                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
++        git(writer, "config", "user.name", "Writer")
++        git(writer, "config", "user.email", "writer@example.org")
++        (writer / "remote.txt").write_text("remote change\n")
++        git(writer, "add", ".")
++        git(writer, "commit", "-m", "remote update")
++        git(writer, "push", "origin", "master")
++        prepare_repository(self.fixture.settings)
++        self.assertTrue((self.fixture.repo / "remote.txt").exists())
++        self.assertEqual(git(self.fixture.repo, "rev-parse", "HEAD"), git(writer, "rev-parse", "HEAD"))
++        (writer / "remote.txt").write_text("second remote change\n")
++        git(writer, "add", ".")
++        git(writer, "commit", "-m", "second remote update")
++        git(writer, "push", "origin", "master")
++        (self.fixture.repo / "local.txt").write_text("local commit\n")
++        self.fixture.commit()
++        local_head = git(self.fixture.repo, "rev-parse", "HEAD")
++        with self.assertRaises(WorkflowError):
++            prepare_repository(self.fixture.settings)
++        self.assertEqual(git(self.fixture.repo, "rev-parse", "HEAD"), local_head)
++        self.assertEqual((self.fixture.repo / "local.txt").read_text(), "local commit\n")
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_gitlab_conversation.py b/tests/test_gitlab_conversation.py
+new file mode 100644
+index 0000000..6046021
+--- /dev/null
++++ b/tests/test_gitlab_conversation.py
+@@ -0,0 +1,262 @@
++import asyncio
++import json
++import unittest
++import warnings
++from unittest.mock import patch
++
++from telegram import Update
++from telegram.ext import ApplicationBuilder
++from telegram.request import BaseRequest
++from telegram.warnings import PTBUserWarning
++
++from bot import build_application
++from gitlab_conversation import telegram_chunks
++from test_gitlab_access import FIXTURE, RepositoryFixture
++
++
++BOT_USER = {"id": 123, "is_bot": True, "first_name": "Test Bot", "username": "infra_test_bot"}
++CHAT = {"id": -1001, "type": "supergroup", "title": "Test"}
++
++
++class FakeTelegramRequest(BaseRequest):
++    """Capture Bot API calls in memory; never connects to Telegram."""
++    def __init__(self):
++        self.calls = []
++        self.messages = []
++        self.next_id = 100
++
++    async def initialize(self):
++        pass
++
++    async def shutdown(self):
++        pass
++
++    async def do_request(self, url, method, request_data=None, **kwargs):
++        endpoint = url.rsplit("/", 1)[1]
++        parameters = request_data.parameters if request_data else {}
++        self.calls.append((endpoint, parameters))
++        if endpoint == "getMe":
++            result = BOT_USER
++        elif endpoint in ("sendMessage", "editMessageText", "editMessageReplyMarkup"):
++            self.next_id += 1
++            result = {"message_id": parameters.get("message_id", self.next_id), "date": 1,
++                      "chat": CHAT, "from": BOT_USER, "text": parameters.get("text", "")}
++            if endpoint == "sendMessage":
++                self.messages.append((result, parameters))
++        elif endpoint == "answerCallbackQuery":
++            result = True
++        else:
++            raise AssertionError("Unexpected Telegram endpoint: " + endpoint)
++        return 200, json.dumps({"ok": True, "result": result}).encode("utf-8")
++
++
++class ConversationTests(unittest.IsolatedAsyncioTestCase):
++    async def asyncSetUp(self):
++        self.fixture = RepositoryFixture()
++        self.api = FakeTelegramRequest()
++        self.jobs = []
++        with patch("bot.ApplicationBuilder", lambda: ApplicationBuilder().request(self.api).get_updates_request(self.api)):
++            with warnings.catch_warnings():
++                warnings.filterwarnings("ignore", category=PTBUserWarning, message=".*per_message.*")
++                self.app = build_application(self.fixture.settings)
++        self.real_create_task = self.app.create_task
++
++        def create_task(coroutine, **kwargs):
++            task = self.real_create_task(coroutine, **kwargs)
++            self.jobs.append(task)
++            return task
++
++        self.app.create_task = create_task
++        await self.app.initialize()
++        await self.app.start()
++        self.next_update = 0
++
++    async def asyncTearDown(self):
++        await self.app.stop()
++        await self.app.shutdown()
++        self.fixture.close()
++
++    def texts(self):
++        return [parameters["text"] for _, parameters in self.api.messages]
++
++    async def text(self, text, user_id=42, chat_id=-1001):
++        self.next_update += 1
++        message = {"message_id": self.next_update, "date": 1,
++                   "chat": {**CHAT, "id": chat_id},
++                   "from": {"id": user_id, "is_bot": False, "first_name": "Operator"}, "text": text}
++        if text.startswith("/"):
++            message["entities"] = [{"type": "bot_command", "offset": 0, "length": len(text.split()[0])}]
++        update = Update.de_json({"update_id": self.next_update, "message": message}, self.app.bot)
++        await self.app.process_update(update)
++
++    def button(self, label, menu=None):
++        message, parameters = menu or self.api.messages[-1]
++        markup = parameters["reply_markup"]
++        if isinstance(markup, str):
++            markup = json.loads(markup)
++        elif hasattr(markup, "to_dict"):
++            markup = markup.to_dict()
++        for row in markup["inline_keyboard"]:
++            for button in row:
++                if button["text"] == label:
++                    return message, button["callback_data"]
++        raise AssertionError("Button not found: " + label)
++
++    async def click(self, button, user_id=42):
++        message, data = button
++        self.next_update += 1
++        update = Update.de_json({"update_id": self.next_update, "callback_query": {
++            "id": str(self.next_update), "chat_instance": "test-chat",
++            "from": {"id": user_id, "is_bot": False, "first_name": "Operator"},
++            "message": message, "data": data,
++        }}, self.app.bot)
++        await self.app.process_update(update)
++
++    async def role_menu(self, user="tuanpv", operator=42):
++        for text in ("/gitlab", "ghub-website", "merchant-portal-client", user):
++            await self.text(text, user_id=operator)
++
++    async def confirmation_menu(self, user="tuanpv", role="developer", operator=42):
++        await self.role_menu(user, operator)
++        await self.click(self.button(role), user_id=operator)
++
++    async def drain(self):
++        if self.jobs:
++            await asyncio.gather(*self.jobs)
++
++    async def test_prompt_sequence_role_buttons_and_no_does_not_edit(self):
++        await self.role_menu()
++        self.assertEqual(self.texts()[:4], ["Nhập tên namespace", "Nhập tên service", "Nhập tên user", "Chọn role"])
++        for role in ("maintainer", "developer", "reporter", "guest"):
++            self.assertIn(":role:" + role, self.button(role)[1])
++        await self.click(self.button("developer"))
++        self.assertIn("user tuanpv chưa có role", self.texts()[-1])
++        self.assertIn("Bạn có muốn thực hiện thay đổi?", self.texts()[-1])
++        await self.click(self.button("No"))
++        self.assertEqual(self.texts()[-1], "Đã dừng luồng.")
++        self.assertEqual(self.fixture.path.read_text(), FIXTURE)
++        self.assertFalse(self.fixture.marker.exists())
++        self.assertFalse(self.jobs)
++
++    async def test_yes_sends_full_git_outputs_before_ansible_and_finishes(self):
++        await self.confirmation_menu()
++        yes = self.button("Yes")
++        await self.click(yes)
++        await self.drain()
++        texts = self.texts()
++        status_index = next(i for i, text in enumerate(texts) if text.startswith("$ git status\n"))
++        diff_index = next(i for i, text in enumerate(texts) if text.startswith("$ git diff group_vars/gitlab-ghub\n"))
++        run_index = next(i for i, text in enumerate(texts) if text.startswith("Kiểm tra Git hợp lệ."))
++        self.assertLess(status_index, diff_index)
++        self.assertLess(diff_index, run_index)
++        self.assertIn('users: ["anhtn", "trung", "tuanpv"]', texts[diff_index])
++        self.assertTrue(self.fixture.marker.exists())
++        self.assertIn("Ansible thành công", texts[-1])
++        # A repeated callback cannot run the playbook twice.
++        await self.click(yes)
++        self.assertEqual(len(self.jobs), 1)
++
++    async def test_existing_user_role_is_shown_before_confirmation(self):
++        await self.confirmation_menu(user="tracth", role="reporter")
++        self.assertIn("user tracth đang có role maintainer", self.texts()[-1])
++        self.assertIn("Role được chọn: reporter", self.texts()[-1])
++        self.assertEqual(self.fixture.path.read_text(), FIXTURE)
++
++    async def test_other_authorized_user_cannot_confirm_someone_elses_request(self):
++        await self.confirmation_menu()
++        yes = self.button("Yes")
++        await self.click(yes, user_id=43)
++        self.assertFalse(self.jobs)
++        self.assertEqual(self.fixture.path.read_text(), FIXTURE)
++        alerts = [parameters for endpoint, parameters in self.api.calls if endpoint == "answerCallbackQuery"]
++        self.assertTrue(alerts[-1]["show_alert"])
++        await self.click(yes, user_id=42)
++        await self.drain()
++        self.assertTrue(self.fixture.marker.exists())
++
++    async def test_old_role_keyboard_is_rejected_after_restart_of_flow(self):
++        await self.role_menu()
++        old_role = self.button("developer")
++        await self.role_menu()
++        current_role = self.button("developer")
++        self.assertNotEqual(old_role[1], current_role[1])
++        await self.click(old_role)
++        self.assertNotIn("Bạn có muốn thực hiện thay đổi?", self.texts()[-1])
++        await self.click(current_role)
++        self.assertIn("Bạn có muốn thực hiện thay đổi?", self.texts()[-1])
++        self.assertEqual(self.fixture.path.read_text(), FIXTURE)
++
++    async def test_cancel_ends_flow_and_stale_keyboard_cannot_mutate(self):
++        await self.confirmation_menu()
++        yes = self.button("Yes")
++        await self.text("/cancel")
++        await self.click(yes)
++        self.assertEqual(self.texts()[-1], "Đã dừng luồng.")
++        self.assertEqual(self.fixture.path.read_text(), FIXTURE)
++        self.assertFalse(self.jobs)
++
++    async def test_unauthorized_user_or_chat_cannot_start(self):
++        await self.text("/gitlab", user_id=99)
++        await self.text("/gitlab", chat_id=-1002)
++        self.assertEqual(self.texts(), ["⛔ Bạn không có quyền dùng bot này."] * 2)
++        self.assertFalse(self.jobs)
++
++    async def test_invalid_input_repeats_the_relevant_prompt(self):
++        await self.text("/gitlab")
++        await self.text("does-not-exist")
++        self.assertIn("Nhập tên namespace", self.texts()[-1])
++        await self.text("ghub-website")
++        await self.text("does-not-exist")
++        self.assertIn("Nhập tên service", self.texts()[-1])
++        await self.text("merchant-portal-client")
++        await self.text("user; command")
++        self.assertIn("Tên user không hợp lệ", self.texts()[-1])
++        self.assertEqual(self.fixture.path.read_text(), FIXTURE)
++
++    async def test_same_role_yes_reports_empty_diff_and_stops_without_ansible(self):
++        await self.confirmation_menu(user="anhtn")
++        await self.click(self.button("Yes"))
++        await self.drain()
++        self.assertTrue(any("(không có diff)" in text for text in self.texts()))
++        self.assertIn("không có diff", self.texts()[-1])
++        self.assertFalse(self.fixture.marker.exists())
++
++    async def test_two_requests_share_a_lock_and_second_run_is_refused(self):
++        await self.confirmation_menu(operator=42)
++        first_yes = self.button("Yes")
++        await self.confirmation_menu(user="second_user", operator=43)
++        second_yes = self.button("Yes")
++        entered = asyncio.Event()
++        release = asyncio.Event()
++        from gitlab_access import GitLabAccessWorkflow
++        original = GitLabAccessWorkflow.run_playbook
++
++        def slow_playbook(workflow, change):
++            loop.call_soon_threadsafe(entered.set)
++            pending = asyncio.run_coroutine_threadsafe(release.wait(), loop)
++            pending.result(timeout=5)
++            return original(workflow, change)
++
++        loop = asyncio.get_running_loop()
++        with patch.object(GitLabAccessWorkflow, "run_playbook", slow_playbook):
++            await self.click(first_yes, user_id=42)
++            await asyncio.wait_for(entered.wait(), timeout=5)
++            await self.click(second_yes, user_id=43)
++            await asyncio.sleep(0)
++            release.set()
++            await self.drain()
++        self.assertTrue(any("Đang có một lượt Ansible chạy" in text for text in self.texts()))
++        self.assertNotIn("second_user", self.fixture.path.read_text())
++
++
++class TelegramOutputTests(unittest.TestCase):
++    def test_large_output_is_complete_and_all_chunks_fit_telegram_limit(self):
++        text = "git diff header\n" + ('users: ["😀", "tuanpv"]\n' * 1000) + "end-of-output"
++        chunks = list(telegram_chunks(text))
++        self.assertGreater(len(chunks), 1)
++        self.assertEqual("".join(chunks), text)
++        self.assertTrue(all(len(chunk.encode("utf-16-le")) // 2 <= 3500 for chunk in chunks))
++
++
++if __name__ == "__main__":
++    unittest.main()

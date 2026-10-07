@@ -14,6 +14,8 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 from config import Settings, load_env_file
+from gitlab_access import GitLabAccessWorkflow
+from gitlab_conversation import create_gitlab_conversation
 from runtime import prepare_repository, start_health_server
 from workflow import Pipeline, WorkflowError
 
@@ -38,6 +40,8 @@ def build_application(settings):
     async def help_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if await authorized(update):
             await update.effective_message.reply_text(
+                "Dùng /gitlab để chọn namespace/service/user/role và cập nhật quyền Ghub. "
+                "Dùng /cancel để dừng trước khi xác nhận.\n"
                 "Dùng /run <source-branch> để chạy playbook GitLab trên branch đã commit "
                 "và tạo GitLab MR nếu Ansible thành công."
             )
@@ -72,6 +76,8 @@ def build_application(settings):
             )
 
     app = ApplicationBuilder().token(settings.telegram_token).concurrent_updates(False).build()
+    for handler in create_gitlab_conversation(GitLabAccessWorkflow(settings), run_lock, authorized):
+        app.add_handler(handler)
     app.add_handler(CommandHandler("start", help_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("run", run_command))

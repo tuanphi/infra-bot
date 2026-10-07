@@ -65,7 +65,10 @@ def prepare_repository(settings):
             "+refs/heads/%s:%s" % (settings.git_target_branch, remote_ref),
             settings=settings, timeout=timeout,
         )
-        _git(repo, "checkout", "--detach", remote_ref, settings=settings)
+        # /gitlab requires a named master branch, including after a restart.
+        # Fast-forward only: retain local commits instead of resetting a branch.
+        _git(repo, "checkout", settings.git_target_branch, settings=settings)
+        _git(repo, "merge", "--ff-only", remote_ref, settings=settings)
 
     commit = _git(repo, "rev-parse", "--verify", "HEAD^{commit}", settings=settings)
     logging.info("Ansible repository ready at %s (commit %s)", repo, commit[:12])
