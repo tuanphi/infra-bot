@@ -1,7 +1,7 @@
 # Luồng /gitlab
 
 Triển khai dựa trên commit `90a5959` của `tuanphi/infra-bot`, dùng cấu trúc
-file `gitlab-ghub(1)` đã cung cấp. Các file mới là `gitlab_access.py` và
+file `gitlab-ghub` đã cung cấp. Các file mới là `gitlab_access.py` và
 `gitlab_conversation.py`; `bot.py`, `runtime.py`, `Dockerfile` và
 `requirements.txt` tích hợp luồng mới. Luồng `/run <source-branch>` vẫn có thể dùng.
 
