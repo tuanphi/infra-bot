@@ -9,6 +9,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Optional
 from urllib.parse import urlsplit
 
 import yaml
@@ -16,7 +17,7 @@ from yaml.nodes import MappingNode, SequenceNode
 from yaml.tokens import AliasToken
 
 from git_auth import redact_git_output
-from workflow import GitLabClient, WorkflowError, _command, _git, _recap, git_command
+from workflow import GitLabClient, ProjectUserAccess, WorkflowError, _command, _git, _recap, git_command
 
 
 ACCESS_FILE = "group_vars/gitlab-ghub"
@@ -49,6 +50,8 @@ class AccessRequest:
     current_roles: tuple
     head: str
     source: bytes
+    project_path: str = ""
+    access: Optional[ProjectUserAccess] = None
 
 
 @dataclass(frozen=True)
@@ -230,11 +233,12 @@ def _atomic_write(path, content):
 
 
 class GitLabAccessWorkflow:
-    def __init__(self, settings, mr_client=None):
+    def __init__(self, settings, mr_client=None, access_client=None):
         self.settings = settings
         self.repo = Path(settings.git_clone_dir).resolve()
         self.path = self.repo / ACCESS_FILE
         self.mr_client = mr_client or GitLabClient(settings)
+        self.access_client = access_client or GitLabClient(settings)
 
     def _git_output(self, *args):
         code, output = git_command(self.settings, [
@@ -298,9 +302,13 @@ class GitLabAccessWorkflow:
         source = self.path.read_bytes()
         _, document, nodes = _load(source)
         project, project_node = _project(document, nodes, namespace, service)
-        access = _access(project, project_node)
-        roles = tuple(level for level in ROLES if username in access[level][0]["users"])
-        return AccessRequest(namespace, service, username, role, roles, report.head, source)
+        _access(project, project_node)
+        access = self.access_client.project_user_access(project["path"], username)
+        roles = (access.role,) if access.role else ()
+        return AccessRequest(
+            namespace, service, access.username, role, roles, report.head, source,
+            project_path=project["path"], access=access,
+        )
 
     def rollback(self, change):
         # Do not overwrite someone else's subsequent edit, or reset other files.
@@ -327,7 +335,11 @@ class GitLabAccessWorkflow:
             raise GitCheckError("Cấu hình đã đổi sau khi chọn role; chạy /gitlab lại để xác nhận thông tin mới.", report)
         content = _updated_content(request)
         if content == request.source:
-            raise GitCheckError("User %s đã có role %s; không có diff để chạy Ansible." % (request.username, request.role), report)
+            raise GitCheckError(
+                "YAML đã chứa user %s ở role %s; không có diff để chạy Ansible. "
+                "Nếu role trên GitLab khác YAML, cần đồng bộ lại bằng playbook."
+                % (request.username, request.role), report,
+            )
         change = AppliedChange(request, content, report)
         _atomic_write(self.path, content)
         try:
@@ -513,4 +525,3 @@ class GitLabAccessWorkflow:
         else:
             self._cancel_change(change, state)
         return state
-        

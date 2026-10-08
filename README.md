@@ -6,13 +6,18 @@ Bot gửi toàn bộ Git status/diff và chạy
 `ansible-playbook -i nonprod gitlab-repos-ghub.yaml --tags=<namespace>,project_user_access`
 khi kiểm tra hợp lệ. Sau Ansible thành công, bot hiện thêm hai nút:
 
-- **Yes:** tạo branch/commit, push và tìm/tạo Merge Request vào `master`.
+- **Yes:** tạo branch/commit local, hiển thị thông tin MR và hỏi xác nhận push.
 - **No:** phục hồi YAML trước thay đổi và chạy lại playbook với cấu hình cũ.
 
-Cả hai lựa chọn đều kết thúc bằng `git switch master` và
+Cả hai lựa chọn đều kết thúc bằng `git checkout master` và
 `git pull --ff-only origin master`. Xem
 [hướng dẫn luồng /gitlab](GITLAB-REPO-ROLE-FLOW.md) để biết kiểm tra Git,
 trạng thái phiên và cách thử lại khi lỗi.
+
+Tại menu **Thông tin merge request**, người dùng xem branch, difference,
+commit SHA và commit message. **Yes** mới push/tìm hoặc tạo MR vào `master`;
+**No** chuyển sang cùng luồng phục hồi YAML/chạy lại Ansible. Các lệnh chuyển
+nhánh dùng `checkout` để tương thích Git chưa hỗ trợ `switch`.
 
 Luồng `/run <source-branch>` chạy lệnh dưới đây từ thư mục gốc của source
 `gitlab.g-pay.vn/devops/ansible/infra`, sau đó tạo GitLab Merge Request khi
@@ -37,7 +42,9 @@ và các dependency role/collection tại môi trường của bạn.
 
 1. Gửi `/gitlab`, nhập namespace → service → username GitLab, rồi chọn một
    role: `maintainer`, `developer`, `reporter`, `guest`.
-2. Bot đọc role hiện tại từ YAML và hỏi xác nhận Yes/No. No hoặc `/cancel`
+2. Bot tra user ID qua `GET /users?username=...`, lấy role hiện tại qua
+   `GET /projects/<encoded-project-path>/members/all/<user-id>` và hỏi xác nhận
+   Yes/No. Tin nhắn gồm role, user ID, project, `access_level`, `expires_at`. No hoặc `/cancel`
    tại bước này kết thúc trước khi sửa file hoặc chạy Ansible.
 3. Yes: bot kiểm tra repo `master` sạch, sửa đúng membership trong
    `group_vars/gitlab-ghub`, gửi Git status/diff và chạy playbook Ghub.
@@ -47,8 +54,8 @@ và các dependency role/collection tại môi trường của bạn.
    Yes: Tạo merge request đẩy lên nhánh master / No: Huỷ thay đổi
    ```
 
-5. Yes cuối: tạo branch theo UTC+7, commit riêng file YAML, push và tìm/tạo
-   MR vào `master`. Tên branch và tiêu đề MR:
+5. Yes sau Ansible: tạo branch theo UTC+7 và commit riêng file YAML tại local.
+   Tên branch và tiêu đề MR:
 
    ```text
    <year>-<month>-<day>-<hour>-<minute>/<namespace>-<service>
@@ -61,30 +68,58 @@ và các dependency role/collection tại môi trường của bạn.
    gitlab-repo: Grant role <role> for <user> to repo <namespace>/<service>
    ```
 
-6. No cuối: phục hồi chính xác YAML trước khi sửa, rồi chạy lại
+6. Bot gửi **Thông tin merge request** gồm branch, target `master`, commit SHA,
+   commit message và toàn bộ difference từ commit trước thay đổi tới commit
+   đã chuẩn bị. Sau đó hỏi Yes/No để xác nhận push/tạo MR.
+7. Yes xác nhận push: kiểm tra lại thông tin đúng bản đã xem, push branch và
+   tìm/tạo MR vào `master`. Chuẩn bị local không tự push hoặc tạo MR.
+8. No sau Ansible hoặc No tại menu xác nhận push: phục hồi chính xác YAML
+   trước khi sửa, rồi chạy lại
    `ansible-playbook -i nonprod gitlab-repos-ghub.yaml
    --tags=<namespace>,project_user_access` để áp dụng cấu hình cũ.
-7. Hoàn tất lựa chọn: switch `master`, pull `--ff-only`, gửi kết quả và nhả khóa.
+   Nếu đã tạo commit local để xem MR, backend kiểm tra bản nháp và checkout
+   lại `master` gốc trước khi chạy playbook với YAML cũ. Branch/commit local
+   được giữ để kiểm tra; lượt bị huỷ không push hoặc tạo MR.
+9. Hoàn tất lựa chọn: `git checkout master`, pull `--ff-only`, gửi kết quả và nhả khóa.
 
 MR được tạo trong repo Ansible do `GITLAB_PROJECT_ID` xác định. MR không tự
-merge; YAML mới vào `master` sau khi merge. Switch về `master` sau Yes không
+merge; YAML mới vào `master` sau khi merge. Checkout về `master` sau Yes không
 chạy lại playbook và không huỷ quyền đã áp dụng. Nên merge MR trước lượt thay
-đổi tiếp theo cho cùng service để preview từ YAML phản ánh cấu hình đã chấp nhận.
+đổi tiếp theo cho cùng service để YAML phản ánh cấu hình đã chấp nhận.
+Role hiển thị được đọc trực tiếp từ API, không suy ra từ YAML.
 
-Khóa dùng chung với `/run` được giữ cả lúc đang chờ quyết định cuối. `/gitlab`
+Khóa dùng chung với `/run` được giữ cả lúc đang chờ quyết định sau Ansible và
+chờ xác nhận push. `/gitlab`
 hoặc `/cancel` của người mở phiên hiển thị lại menu khi đang chờ, hoặc báo đang
-xử lý nếu backend chưa xong. Nút của phiên cũ hoặc người khác không có hiệu lực.
+xử lý nếu backend chưa xong. Ở bước xem MR, bot gửi lại thông tin MR cùng nút
+xác nhận push. Ba menu dùng callback riêng `:confirm:`, `:final:` và `:push:`;
+nút của phiên cũ hoặc người khác không có hiệu lực.
 
 Nếu Ansible lần đầu lỗi/timeout, bot giữ diff để kiểm tra và kết thúc phiên vì
 quyền có thể đã áp dụng một phần. Nếu lỗi khi hoàn tất Yes/No, bot giữ phiên,
-khóa và trạng thái từng bước để thử lại. Sau khi lựa chọn đã bắt đầu được xử
-lý, bot chỉ hiện nút tương ứng; không tạo lại commit đã có hoặc MR đang mở khi
-thử lại. Nhánh đã push vẫn được thử switch/pull về `master` kể cả khi API MR lỗi.
+khóa và trạng thái từng bước để thử lại. Trước khi xác nhận push, No vẫn huỷ
+được cả bản nháp đã commit local. Sau khi đã xác nhận push, bot chỉ hiện Yes
+để thử lại; sau khi đã bắt đầu phục hồi, bot chỉ hiện No. Thử lại dùng cùng
+commit/thông tin đã duyệt và tìm MR đang mở để tránh tạo trùng. Nhánh đã push
+vẫn được thử checkout/pull về `master` kể cả khi API MR lỗi.
 
 No phục hồi YAML và chạy lại playbook; quyền thực tế chỉ trở về trạng thái cũ
 khi playbook xử lý cả thu hồi membership dư và phục hồi role. Cần kiểm tra
 trường hợp user ban đầu chưa có quyền. Phiên nằm trong bộ nhớ và mất khi
 restart; cần kiểm tra checkout, branch/MR và quyền nếu lượt bị gián đoạn.
+
+Role API được ánh xạ: `10=guest`, `15=planner`, `20=reporter`, `30=developer`,
+`40=maintainer`, `50=owner`; hỗ trợ hiển thị thêm 0/5/25 và giữ mã lạ dưới dạng
+`unknown (<access_level>)`. Role để ghi YAML vẫn chỉ có bốn lựa chọn hiện có.
+`members/all` bao gồm membership kế thừa từ group mà token được phép xem.
+
+User không tồn tại: báo lỗi. Membership 404: kiểm tra project đọc được trước
+khi hiển thị chưa có membership. Lỗi token/quyền/mạng/JSON: dừng bước kiểm tra,
+không dùng YAML làm kết quả thay thế. Nếu YAML đã chứa role chọn nhưng API
+khác, bot báo không có diff và yêu cầu đồng bộ lại bằng playbook.
+No khôi phục YAML cũ; nếu YAML vốn khác role API, No không đảm bảo khôi phục
+đúng role API trước thay đổi. Chi tiết và bảng mức quyền ở
+[hướng dẫn kiểm tra role](GITLAB-REPO-ROLE-FLOW.md#kiểm-tra-role-bằng-gitlab-rest-api).
 
 ## Luồng /run
 
@@ -101,7 +136,7 @@ restart; cần kiểm tra checkout, branch/MR và quyền nếu lượt bị gi�
 Việc chạy playbook có hiệu lực trên máy nonprod **trước** khi MR được merge, đúng
 thứ tự yêu cầu. Chạy lại cùng branch có thể chạy lại Ansible; playbook cần có
 tính idempotent. Bot chỉ cho phép một lượt xử lý tại một thời điểm trong một
-process, bao gồm lúc `/gitlab` đang chờ Yes/No cuối; triển khai đúng **một replica**
+process, bao gồm lúc `/gitlab` đang chờ quyết định hoặc xác nhận push; triển khai đúng **một replica**
 khi dùng Telegram polling.
 
 ## Khởi động và HTTP health
@@ -140,7 +175,9 @@ git clone --no-tags --single-branch --branch master -- \
 Sau khi clone, bot đặt lại `remote.origin.url` về URL không chứa credential.
 Các lệnh fetch/ls-remote/pull/push dùng Git credential helper với cùng `GITLAB_USERNAME`
 và `GITLAB_TOKEN`; helper chỉ trả credential cho đúng host và đường dẫn repo.
-Token cần quyền đọc/push repo Ansible và quyền API tìm/tạo MR trong project đó.
+Token cần quyền đọc/push repo Ansible, API tìm/tạo MR trong project đó và đọc
+user/project service/membership để kiểm tra role. API Python cần CA được tin cậy
+trong Python/container; `GIT_SSL_CAINFO` chỉ áp dụng cho Git.
 Giữ xác minh TLS; CA nội bộ phải có trong trust store hoặc cấu hình Git bằng
 `GIT_SSL_CAINFO` trỏ đến file CA đã mount.
 
@@ -208,7 +245,7 @@ Env được nạp chỉ thuộc tiến trình bot và các tiến trình con m�
 bao gồm Git/Ansible. `docker exec env` chạy một tiến trình khác nên không hiển
 thị những biến được nạp riêng bên trong bot. Đổi `.env` cần khởi động lại bot.
 
-GitLab token cần quyền API tìm/tạo MR và đọc/push repo qua HTTPS; Ansible SSH key
+GitLab token cần quyền API đọc user/project/membership, tìm/tạo MR và đọc/push repo qua HTTPS; Ansible SSH key
 cần kết nối đúng host nonprod. Nếu dùng URL Git SSH, key cũng cần quyền đọc/push repo.
 Nếu playbook dùng Ansible Vault, bổ sung secret
 và `ANSIBLE_VAULT_PASSWORD_FILE` vào runtime. Nếu repo khai báo roles/collections,
@@ -216,7 +253,8 @@ cài đúng phiên bản theo repo trước khi chạy.
 
 `GITLAB_PROJECT_ID` nhận project ID dạng số hoặc đường dẫn namespace/project;
 API sẽ URL-encode giá trị; đặt ID/path của repo Ansible `devops/ansible/infra`,
-không phải project service được cấp quyền. Với `/gitlab`, đặt
+không phải project service được cấp quyền. API kiểm tra role dùng đầy đủ
+`project.path` lấy từ YAML, ví dụ `development/ghub-website/merchant-portal-client`. Với `/gitlab`, đặt
 `GIT_TARGET_BRANCH=master`; branch này phải tồn tại trên GitLab.
 Lệnh chạy không chấp nhận tham số Ansible tùy ý từ Telegram. Để debug, thực
 hiện thủ công trên cùng commit và cùng môi trường; bot chỉ trả về `PLAY RECAP`
@@ -224,10 +262,13 @@ hiện thủ công trên cùng commit và cùng môi trường; bot chỉ trả 
 
 ## Kiểm tra
 
-Thay đổi luồng Yes/No sau Ansible đã qua 16 kiểm tra local với repo Git thật,
-executable Ansible giả và API GitLab/Telegram mô phỏng. Bao gồm commit/MR đúng
-mẫu, phục hồi YAML trước Ansible, lỗi push/MR/pull và thử lại, bảo vệ thay đổi
-ngoài dự kiến, quyền/nút Telegram, khóa phiên và cú pháp Python 3.8.
+Đợt này đã qua 21 kiểm tra API/preview/hội thoại và `/run`/MR, cùng 28 kiểm tra
+hồi quy luồng sau Ansible. Bao gồm role API khác YAML, các mức quyền, user
+không tồn tại, phân biệt membership 404 với project không đọc được, lỗi token,
+JSON, kết nối; ba menu Yes/No, push sau duyệt, No sau commit và thử lại khi lỗi.
+API GitLab/Telegram được mô phỏng; Git dùng repo thật trong thư mục tạm.
+Cú pháp tương thích Python 3.8 đã được kiểm tra, runtime test dùng Python 3.12.
+Chưa thử trên GitLab nội bộ thật.
 
 Tại container, kiểm tra cú pháp các module:
 
@@ -235,7 +276,7 @@ Tại container, kiểm tra cú pháp các module:
 python -m py_compile bot.py config.py git_auth.py runtime.py workflow.py gitlab_access.py gitlab_conversation.py
 ```
 
-Kiểm tra tích hợp trên service thử nghiệm: hai bước Yes/No, quyền trước/sau No,
+Kiểm tra tích hợp trên service thử nghiệm: ba bước Yes/No, quyền trước/sau No,
 branch/commit/MR sau Yes, `master` sạch và đã pull, nút cũ/người khác, chặn `/run`
 khi chờ quyết định và thử lại khi lỗi. Các bước cụ thể nằm trong
 [hướng dẫn kiểm chứng luồng /gitlab](GITLAB-REPO-ROLE-FLOW.md#kiểm-chứng).

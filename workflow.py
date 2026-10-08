@@ -9,9 +9,10 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 
 from config import Settings
 from git_auth import authenticated_repo_url, git_environment, redact_git_output
@@ -21,6 +22,12 @@ PLAYBOOK = "gitlab-repos.yaml"
 INVENTORY = "nonprod"
 TAG = "project_user_access"
 BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,100}$")
+ACCESS_LEVEL_ROLES = {
+    0: "no access", 5: "minimal access", 10: "guest", 15: "planner",
+    20: "reporter", 25: "security manager", 30: "developer",
+    40: "maintainer", 50: "owner",
+}
+_MEMBER_NOT_FOUND = object()
 
 
 class WorkflowError(Exception):
@@ -33,6 +40,21 @@ class Result:
     commit: str
     mr_url: str
     recap: str
+
+
+@dataclass(frozen=True)
+class ProjectUserAccess:
+    user_id: int
+    username: str
+    name: str
+    access_level: Optional[int] = None
+    expires_at: Optional[str] = None
+
+    @property
+    def role(self):
+        if self.access_level is None:
+            return ""
+        return ACCESS_LEVEL_ROLES.get(self.access_level, "unknown (%s)" % self.access_level)
 
 
 def validate_branch(branch):
@@ -138,6 +160,69 @@ class GitLabClient:
         )
         with self.opener(req, timeout=30) as response:
             return json.load(response)
+
+    def _access_json(self, path, allow_missing_member=False):
+        url = self.settings.gitlab_url.rstrip("/") + "/api/v4/" + path
+        try:
+            return self._request_json(url, {"PRIVATE-TOKEN": self.settings.gitlab_token})
+        except HTTPError as exc:
+            if allow_missing_member and exc.code == 404:
+                return _MEMBER_NOT_FOUND
+            notes = {
+                401: "Token GitLab không hợp lệ hoặc đã hết hạn.",
+                403: "Token không có quyền đọc user/project/membership.",
+                404: "User/project không tồn tại hoặc token không có quyền xem.",
+            }
+            raise WorkflowError(
+                "Không kiểm tra được role qua GitLab API (HTTP %s). %s"
+                % (exc.code, notes.get(exc.code, "Thử lại sau hoặc kiểm tra GitLab."))
+            ) from None
+        except (URLError, OSError, ValueError, TypeError) as exc:
+            # Do not expose URLs, tokens, or untrusted response bodies.
+            raise WorkflowError(
+                "Không kiểm tra được role qua GitLab API (%s); kiểm tra kết nối, CA và phản hồi JSON."
+                % type(exc).__name__
+            ) from None
+
+    def project_user_access(self, project_path, username):
+        users = self._access_json("users?" + urlencode({"username": username}))
+        if not isinstance(users, list):
+            raise WorkflowError("GitLab API trả danh sách user không hợp lệ.")
+        matches = [user for user in users if isinstance(user, dict)
+                   and isinstance(user.get("username"), str)
+                   and user["username"].casefold() == username.casefold()]
+        if not matches:
+            raise WorkflowError("Không tìm thấy user %s trên GitLab." % username)
+        if len(matches) != 1:
+            raise WorkflowError("GitLab API trả nhiều user trùng username; dừng kiểm tra role.")
+        user = matches[0]
+        user_id = user.get("id")
+        if type(user_id) is not int or user_id <= 0 or not isinstance(user.get("name"), str):
+            raise WorkflowError("GitLab API trả thông tin user không hợp lệ.")
+
+        # The service path comes from YAML, not the Ansible MR project ID.
+        project_resource = "projects/" + quote(project_path, safe="")
+        member = self._access_json(
+            "%s/members/all/%s" % (project_resource, user_id), allow_missing_member=True,
+        )
+        if member is _MEMBER_NOT_FOUND:
+            # A membership 404 may also hide an inaccessible/nonexistent project.
+            project = self._access_json(project_resource)
+            if (not isinstance(project, dict) or type(project.get("id")) is not int
+                    or project["id"] <= 0):
+                raise WorkflowError("GitLab API trả thông tin project không hợp lệ.")
+            return ProjectUserAccess(user_id, user["username"], user["name"])
+
+        if (not isinstance(member, dict) or type(member.get("id")) is not int
+                or member["id"] != user_id or not isinstance(member.get("username"), str)
+                or member["username"].casefold() != user["username"].casefold()
+                or type(member.get("access_level")) is not int or member["access_level"] < 0
+                or (member.get("expires_at") is not None
+                    and not isinstance(member["expires_at"], str))):
+            raise WorkflowError("GitLab API trả thông tin membership không hợp lệ; dừng kiểm tra role.")
+        return ProjectUserAccess(
+            user_id, user["username"], user["name"], member["access_level"], member.get("expires_at"),
+        )
 
     def create_or_get_mr(self, branch, commit, requester, recap, *,
                          title=None, command=None, target_branch=None):

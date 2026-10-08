@@ -168,8 +168,16 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
             await clear_session(update, ctx)
             return ConversationHandler.END
         session["request"] = request
-        status = ("user %s đang có role %s" % (request.username, ", ".join(request.current_roles))
-                  if request.current_roles else "user %s chưa có role" % request.username)
+        status = ("user %s đang có role %s (GitLab API)"
+                  % (request.username, ", ".join(request.current_roles))
+                  if request.current_roles else
+                  "user %s chưa có membership trong project (GitLab API)" % request.username)
+        if request.access is not None:
+            status += "\nUser ID: %s\nProject: %s\naccess_level: %s\nexpires_at: %s" % (
+                request.access.user_id, request.project_path,
+                request.access.access_level if request.access.access_level is not None else "none",
+                request.access.expires_at or "none",
+            )
         keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton("Yes", callback_data="gitlab:%s:confirm:yes" % session["nonce"]),
             InlineKeyboardButton("No", callback_data="gitlab:%s:confirm:no" % session["nonce"]),
@@ -414,4 +422,3 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
         CommandHandler("cancel", cancel),
         CallbackQueryHandler(stale_callback, pattern=r"^gitlab:"),
     )
-    
