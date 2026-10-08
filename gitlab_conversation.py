@@ -11,7 +11,7 @@ from telegram.error import TelegramError
 from telegram.ext import CallbackQueryHandler, CommandHandler, ConversationHandler, MessageHandler, filters
 from telegram.warnings import PTBUserWarning
 
-from gitlab_access import GitCheckError, ROLES, USERNAME
+from gitlab_access import Finalization, GitCheckError, MergeRequestInfo, ROLES, USERNAME
 from workflow import WorkflowError
 
 
@@ -75,10 +75,17 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
     async def start(update, ctx):
         if not await authorized(update):
             return ConversationHandler.END
-        await clear_session(update, ctx)
-        if run_lock.locked():
-            await update.effective_message.reply_text("Đang có một lượt Ansible chạy; thử lại sau.")
+        session = get_session(update, ctx)
+        if session and session.get("active"):
+            if session.get("stage") in ("decision", "review"):
+                await show_pending_menu(update.effective_message, session)
+            else:
+                await update.effective_message.reply_text("Lượt hiện tại đang xử lý; vui lòng chờ.")
             return ConversationHandler.END
+        if run_lock.locked():
+            await update.effective_message.reply_text("Repo đang được xử lý hoặc chờ Yes/No; thử lại sau.")
+            return ConversationHandler.END
+        await clear_session(update, ctx)
         ctx.user_data.setdefault(SESSION_KEY, {})[update.effective_chat.id] = {
             "nonce": secrets.token_hex(6), "chat_id": update.effective_chat.id,
         }
@@ -174,11 +181,55 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
         session["menu_id"] = message.message_id
         return CONFIRM
 
-    async def apply_request(message, request):
-        if run_lock.locked():
-            await message.reply_text("Đang có một lượt Ansible chạy; thử lại bằng /gitlab sau.")
-            return
-        async with run_lock:
+    def final_choices(session):
+        state = session["finalization"]
+        if state.action == "no":
+            return ("no",)
+        if state.push_confirmed:
+            return ("yes",)
+        return ("yes", "no")
+
+    async def show_final_menu(message, session):
+        choices = final_choices(session)
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                answer.title(), callback_data="gitlab:%s:final:%s" % (session["nonce"], answer),
+            ) for answer in choices
+        ]])
+        text = ("Thử lại %s để hoàn tất lượt hiện tại." % choices[0].title() if len(choices) == 1 else
+                "Yes: Tạo merge request đẩy lên nhánh master / No: Huỷ thay đổi")
+        menu = await message.reply_text(text, reply_markup=keyboard)
+        session["menu_id"] = menu.message_id
+
+    async def show_merge_review(message, session):
+        info = session["mr_preview"]
+        await reply_full(
+            message,
+            "Thông tin merge request\nBranch: %s\nTarget: master\nCommit: %s\nCommit message: %s\n\nDifference:\n%s"
+            % (info.branch, info.commit, info.message, info.difference),
+        )
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(answer.title(), callback_data="gitlab:%s:push:%s" % (session["nonce"], answer))
+            for answer in ("yes", "no")
+        ]])
+        menu = await message.reply_text(
+            "Bạn có muốn push branch và tạo merge request không?\nYes: Push và tạo MR / No: Huỷ thay đổi",
+            reply_markup=keyboard,
+        )
+        session.update(menu_id=menu.message_id, stage="review")
+
+    async def show_pending_menu(message, session):
+        if session.get("stage") == "review":
+            await show_merge_review(message, session)
+        else:
+            await show_final_menu(message, session)
+
+    async def apply_request(update, ctx, session):
+        message = update.effective_message
+        request = session["request"]
+        # confirmation_input acquired the shared lock before creating this task.
+        awaiting_decision = False
+        try:
             change = None
             playbook_started = False
             try:
@@ -203,27 +254,124 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
                     await backend(workflow.rollback, change)
                 await message.reply_text("❌ Lỗi nội bộ; kiểm tra log bot.")
                 return
-            await reply_full(message, "✅ Ansible thành công.\n%s/%s: user %s → %s\n%s\nDiff YAML được giữ để commit."
-                             % (request.namespace, request.service, request.username, request.role, result.recap))
+            session.update(stage="decision", change=change, recap=result.recap)
+            awaiting_decision = True
+            try:
+                await reply_full(message, "✅ Ansible thành công.\n%s/%s: user %s → %s\n%s"
+                                 % (request.namespace, request.service, request.username, request.role, result.recap))
+                await show_final_menu(message, session)
+            except TelegramError:
+                logging.exception("Cannot show final menu; /gitlab can show it again")
+
+        finally:
+            # The session reserves the repo while waiting, without a sleeping task.
+            if not awaiting_decision:
+                try:
+                    await clear_session(update, ctx)
+                finally:
+                    run_lock.release()
+
+    async def finish_request(update, ctx, session, review=None):
+        message = update.effective_message
+        if review is None and session["finalization"].push_confirmed:
+            review = session.get("mr_preview")
+        try:
+            state = await backend(
+                workflow.finalize, session["change"], session["answer"],
+                update.effective_user.id, session["recap"], session["finalization"],
+                review,
+            )
+        except Exception as exc:
+            session["stage"] = "decision"
+            if not isinstance(exc, WorkflowError):
+                logging.exception("Unexpected finalization failure")
+            try:
+                if isinstance(exc, GitCheckError):
+                    await reply_git_report(message, exc.report)
+                await reply_full(message, "❌ " + (str(exc) if isinstance(exc, WorkflowError)
+                                                 else "Lỗi nội bộ; kiểm tra log bot."))
+                await show_final_menu(message, session)
+            except TelegramError:
+                logging.exception("Cannot show retry menu; /gitlab can show it again")
+            return
+        if isinstance(state, MergeRequestInfo):
+            session["mr_preview"] = state
+            try:
+                await show_merge_review(message, session)
+            except TelegramError:
+                session["stage"] = "review"
+                logging.exception("Cannot show MR review; /gitlab can show it again")
+            return
+        try:
+            if state.action == "yes":
+                await reply_full(message, "✅ Đã tạo merge request.\nBranch: %s\nCommit: %s\nMR: %s\nĐã về master và git pull --ff-only."
+                                 % (state.branch, state.commit[:12], state.mr_url))
+            else:
+                await message.reply_text("✅ Đã phục hồi YAML và chạy lại Ansible với cấu hình cũ.\nĐã về master và git pull --ff-only.")
+        except TelegramError:
+            logging.exception("Finalization completed but Telegram reply failed")
+        finally:
+            try:
+                await clear_session(update, ctx)
+            finally:
+                run_lock.release()
 
     async def confirmation_input(update, ctx):
         session = await callback_session(update, ctx)
         if session is None:
             return CONFIRM
         answer = update.callback_query.data.rsplit(":", 1)[1]
-        request = session["request"]
         await update.callback_query.edit_message_reply_markup(reply_markup=None)
-        pop_session(update, ctx)
         if answer == "no":
+            await clear_session(update, ctx)
             await update.effective_message.reply_text("Đã dừng luồng.")
         else:
-            await update.effective_message.reply_text("Đã xác nhận. Đang cập nhật cấu hình...")
-            # Keep polling responsive; the shared lock prevents overlapping runs.
-            ctx.application.create_task(apply_request(update.effective_message, request), update=update)
+            if run_lock.locked():
+                await clear_session(update, ctx)
+                await update.effective_message.reply_text("Repo đang được xử lý hoặc chờ Yes/No; thử lại sau.")
+                return ConversationHandler.END
+            await run_lock.acquire()
+            session.update(active=True, stage="applying", menu_id=None, finalization=Finalization())
+            ctx.application.create_task(apply_request(update, ctx, session), update=update)
         return ConversationHandler.END
+
+    async def final_input(update, ctx):
+        session = await callback_session(update, ctx)
+        if session is None or session.get("stage") != "decision":
+            return
+        answer = update.callback_query.data.rsplit(":", 1)[1]
+        if answer not in final_choices(session):
+            await update.effective_message.reply_text("Lượt hiện tại chỉ cho phép thử lại lựa chọn đang xử lý.")
+            return
+        session.update(answer=answer, stage="finishing", menu_id=None)
+        try:
+            await update.callback_query.edit_message_reply_markup(reply_markup=None)
+        except TelegramError:
+            logging.exception("Cannot remove final keyboard")
+        ctx.application.create_task(finish_request(update, ctx, session), update=update)
+
+    async def push_input(update, ctx):
+        session = await callback_session(update, ctx)
+        if session is None or session.get("stage") != "review":
+            return
+        answer = update.callback_query.data.rsplit(":", 1)[1]
+        review = session["mr_preview"] if answer == "yes" else None
+        session.update(answer=answer, stage="finishing", menu_id=None)
+        try:
+            await update.callback_query.edit_message_reply_markup(reply_markup=None)
+        except TelegramError:
+            logging.exception("Cannot remove push confirmation keyboard")
+        ctx.application.create_task(finish_request(update, ctx, session, review), update=update)
 
     async def cancel(update, ctx):
         if await authorized(update):
+            session = get_session(update, ctx)
+            if session and session.get("active"):
+                if session.get("stage") in ("decision", "review"):
+                    await show_pending_menu(update.effective_message, session)
+                else:
+                    await update.effective_message.reply_text("Lượt hiện tại đang xử lý; vui lòng chờ.")
+                return ConversationHandler.END
             await clear_session(update, ctx)
             await update.effective_message.reply_text("Đã dừng luồng.")
         return ConversationHandler.END
@@ -259,4 +407,11 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
             fallbacks=[CommandHandler("cancel", cancel)],
             allow_reentry=True, per_chat=True, per_user=True, per_message=False,
         )
-    return conversation, CallbackQueryHandler(stale_callback, pattern=r"^gitlab:")
+    return (
+        conversation,
+        CallbackQueryHandler(final_input, pattern=r"^gitlab:[0-9a-f]{12}:final:(yes|no)$"),
+        CallbackQueryHandler(push_input, pattern=r"^gitlab:[0-9a-f]{12}:push:(yes|no)$"),
+        CommandHandler("cancel", cancel),
+        CallbackQueryHandler(stale_callback, pattern=r"^gitlab:"),
+    )
+    

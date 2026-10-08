@@ -139,14 +139,17 @@ class GitLabClient:
         with self.opener(req, timeout=30) as response:
             return json.load(response)
 
-    def create_or_get_mr(self, branch, commit, requester, recap):
+    def create_or_get_mr(self, branch, commit, requester, recap, *,
+                         title=None, command=None, target_branch=None):
+        target_branch = target_branch or self.settings.git_target_branch
+        command = command or "ansible-playbook -i nonprod gitlab-repos.yaml --tags=project_user_access"
         base = "%s/api/v4/projects/%s/merge_requests" % (
             self.settings.gitlab_url, quote(self.settings.gitlab_project_id, safe="")
         )
         headers = {"PRIVATE-TOKEN": self.settings.gitlab_token}
         query = {
             "state": "opened", "source_branch": branch,
-            "target_branch": self.settings.git_target_branch,
+            "target_branch": target_branch,
         }
         try:
             matches = self._request_json(base + "?" + urlencode(query), headers)
@@ -155,17 +158,17 @@ class GitLabClient:
 
             description = (
                 "Ansible execution passed before opening this MR.\n\n"
-                "Command: `ansible-playbook -i nonprod gitlab-repos.yaml --tags=project_user_access`\n"
+                "Command: `%s`\n"
                 "Commit tested: `%s`\nRequested by Telegram user ID: `%s`\n"
                 "Completed (UTC): %s\n\n```\n%s\n```"
-                % (commit, requester, datetime.now(timezone.utc).isoformat(), recap)
+                % (command, commit, requester, datetime.now(timezone.utc).isoformat(), recap)
             )
             created = self._request_json(
                 base, headers,
                 payload={
                     "source_branch": branch,
-                    "target_branch": self.settings.git_target_branch,
-                    "title": "GitLab project_user_access: %s" % branch,
+                    "target_branch": target_branch,
+                    "title": title or "GitLab project_user_access: %s" % branch,
                     "description": description,
                     "remove_source_branch": True,
                 },

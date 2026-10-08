@@ -1,21 +1,28 @@
 # Luồng /gitlab
 
-Triển khai dựa trên commit `90a5959` của `tuanphi/infra-bot`, dùng cấu trúc
-file `gitlab-ghub` đã cung cấp. Các file mới là `gitlab_access.py` và
-`gitlab_conversation.py`; `bot.py`, `runtime.py`, `Dockerfile` và
-`requirements.txt` tích hợp luồng mới. Luồng `/run <source-branch>` vẫn có thể dùng.
+Tài liệu mô tả luồng `/gitlab` đã bổ sung quyết định Yes/No sau Ansible, dựa
+trên source `master` ở commit `456df3a` của `tuanphi/infra-bot`.
+`gitlab_conversation.py` quản lý hội thoại; `gitlab_access.py` sửa YAML, chạy
+playbook và hoàn tất thay đổi; `workflow.py` cung cấp Git helper và GitLab MR
+client. Luồng `/run <source-branch>` vẫn dùng source đã commit/push từ trước.
 
 ## Hội thoại
 
 ```mermaid
 flowchart TD
-    A["/gitlab: nhập namespace, service, user"] --> B["Chọn role; xem role hiện tại"]
-    B --> C{"Bạn có muốn thực hiện thay đổi?"}
-    C -->|No| D["Dừng"]
-    C -->|Yes| E["Sửa users_access; gửi git status và git diff"]
-    E --> F{"Git và diff hợp lệ?"}
-    F -->|False| D
-    F -->|True| G["Chạy Ansible trong /app/infra"]
+    A["Nhập namespace, service, user; chọn role"] --> B{"Xác nhận thay đổi?"}
+    B -->|No| C["Dừng trước khi sửa YAML"]
+    B -->|Yes| D["Sửa YAML; kiểm tra Git; chạy Ansible"]
+    D -->|Lỗi| E["Báo lỗi; kiểm tra Git và quyền đã áp dụng"]
+    D -->|Thành công| F{"Tạo MR hay huỷ thay đổi?"}
+    F -->|Yes| G["Tạo branch; commit; push; tạo MR"]
+    F -->|No| H["Phục hồi YAML; chạy lại Ansible"]
+    G -->|Thành công| I["Switch master; pull ff-only"]
+    H -->|Thành công| I
+    G -->|Lỗi| K["Giữ phiên để thử lại"]
+    H -->|Lỗi| K
+    I -->|Lỗi| K
+    I -->|Thành công| J["Kết thúc phiên; nhả khóa"]
 ```
 
 1. `/gitlab` → bot hiển thị **Nhập tên namespace**.
@@ -42,11 +49,28 @@ flowchart TD
 6. Chọn **No** hoặc gửi `/cancel` → dừng, chưa sửa file/chạy Ansible.
 7. Chọn **Yes** → backend sửa YAML, gửi đầy đủ output của `git status`
    và `git diff group_vars/gitlab-ghub`, rồi chạy Ansible nếu kiểm tra hợp lệ.
+8. Ansible exit 0 → bot gửi kết quả và PLAY RECAP, sau đó hiển thị:
+
+   ```text
+   Yes: Tạo merge request đẩy lên nhánh master / No: Huỷ thay đổi
+   ```
+
+   Tin nhắn có hai nút **Yes** và **No**. Đây là quyết định sau khi quyền đã
+   được áp dụng qua playbook, khác bước xác nhận trước khi chạy Ansible.
+9. **Yes** → tạo branch, commit riêng file YAML, push và tìm/tạo MR vào `master`.
+   **No** → phục hồi YAML trước khi sửa và chạy lại cùng playbook/cùng namespace.
+10. Sau khi hoàn tất lựa chọn, bot chạy `git switch master` và
+    `git pull --ff-only origin master`, gửi kết quả, xoá phiên và nhả khóa.
 
 Chỉ Telegram user thuộc `ALLOWED_USER_IDS`, trong `ALLOWED_GROUP_ID`, mới được
 đi qua luồng. Nút của người khác, nút của phiên cũ hoặc nút đã xác nhận không
-thể áp dụng lại yêu cầu. `/gitlab` có thể khởi tạo lại phiên trước khi xác nhận.
-Sau Yes, tác vụ chạy riêng và không bị hủy bởi `/cancel`.
+thể áp dụng lại yêu cầu. Phiên được đối chiếu theo chat, user, nonce và message ID.
+Callback trước Ansible dùng `:confirm:`; callback sau Ansible dùng `:final:`.
+
+`/gitlab` có thể khởi tạo lại phiên trước khi xác nhận. Sau khi xác nhận Yes
+lần đầu, `/cancel` không huỷ tác vụ đang chạy. Khi đang chờ quyết định cuối,
+`/gitlab` hoặc `/cancel` của người mở phiên hiển thị lại menu; khi backend đang
+xử lý, bot yêu cầu chờ. Menu được gửi lại làm nút trên menu trước đó hết hiệu lực.
 
 ## Tìm namespace và service
 
@@ -110,8 +134,11 @@ ansible-playbook -i nonprod gitlab-repos-ghub.yaml --tags=ghub-website,project_u
 ```
 
 `ghub-website` được thay bằng namespace đã chọn. Không ghép shell command từ
-nội dung người dùng. Một khóa dùng chung với `/run` chỉ cho phép một lượt
-Ansible trong một process; dùng một replica cho Telegram polling.
+nội dung người dùng. Khóa `run_lock` dùng chung với `/run` được giữ từ lúc
+xác nhận Yes lần đầu, qua chạy Ansible, chờ quyết định cuối và hoàn tất Yes/No.
+Trong thời gian này, lượt `/run` hoặc `/gitlab` khác không thể sử dụng repo.
+Chỉ triển khai một replica cho Telegram polling; khóa này chỉ có hiệu lực
+trong một process.
 
 `--tags=namespace,project_user_access` chọn task khớp **một trong hai** tag;
 phạm vi thực thi còn phụ thuộc cách gắn tag/include/role trong playbook.
@@ -119,22 +146,119 @@ Cần kiểm tra `gitlab-repos-ghub.yaml` và các task của repo infra để x
 phạm vi quyền thực tế. Tham khảo
 [Ansible: Selecting or skipping tags](https://docs.ansible.com/projects/ansible-core/2.13/user_guide/playbooks_tags.html#selecting-or-skipping-tags-when-you-run-a-playbook).
 
-Ansible exit 0: bot gửi kết quả và PLAY RECAP nếu có. Exit khác 0 hoặc timeout:
-bot báo lỗi và giữ diff để kiểm tra vì playbook có thể đã áp dụng một phần.
+Ansible exit 0: bot gửi kết quả và PLAY RECAP nếu có, giữ bản YAML đã sửa và
+phiên hiện tại để chờ quyết định cuối. Tác vụ nền kết thúc sau khi gửi menu;
+khóa vẫn do phiên giữ, không cần một task chờ vô hạn.
 
-Sau khi chạy, file YAML giữ thay đổi chưa commit. Người vận hành cần xử lý
-diff này bằng quy trình Git hiện có trước lượt `/gitlab` tiếp theo hoặc trước
-khi khởi động lại bot. Bảy bước này kết thúc ở chạy Ansible; việc commit/push/MR
-không được tự bổ sung vào luồng.
+Ansible lần đầu exit khác 0 hoặc timeout: bot báo lỗi, giữ diff để kiểm tra vì
+playbook có thể đã áp dụng một phần, kết thúc phiên và nhả khóa. Trường hợp
+này không hiện menu tạo MR/huỷ thay đổi và cần người vận hành kiểm tra trước
+lượt `/gitlab` tiếp theo.
+
+## Quyết định No sau Ansible
+
+Backend chỉ phục hồi khi branch/commit và file còn khớp bản sửa của lượt hiện
+tại. Nếu người vận hành đã sửa file hoặc thêm thay đổi ngoài dự kiến, bot dừng
+và giữ dữ liệu để kiểm tra.
+
+Thứ tự xử lý:
+
+1. Ghi lại chính xác nội dung `group_vars/gitlab-ghub` trước khi sửa, lấy từ
+   `change.request.source`; giữ user/role cũ của service.
+2. Chạy lại `ansible-playbook -i nonprod gitlab-repos-ghub.yaml
+   --tags=<namespace>,project_user_access` trong `/app/infra`.
+3. Khi Ansible exit 0, đánh dấu đã chạy phục hồi, rồi switch `master` và pull
+   fast-forward.
+4. Gửi thông báo đã phục hồi YAML, chạy lại Ansible với cấu hình cũ và cập nhật
+   `master`; kết thúc phiên.
+
+Nếu Ansible phục hồi thất bại, YAML cũ vẫn được giữ, phiên và khóa vẫn còn;
+bot hiện nút **No** để thử lại. Nếu Ansible đã thành công nhưng pull lỗi, lần
+thử lại chỉ tiếp tục bước cập nhật `master`.
+
+Phục hồi YAML và Ansible exit 0 không tự chứng minh membership trên GitLab đã
+trở về trạng thái cũ. Playbook cần xử lý việc thu hồi user bị loại khỏi YAML
+và đổi lại role cũ; đặc biệt phải kiểm tra trường hợp user ban đầu chưa có quyền.
+
+## Quyết định Yes sau Ansible
+
+Backend kiểm tra lại Git và nội dung file trước khi tạo branch/commit.
+Tên branch và tiêu đề MR có cùng mẫu, dùng thời gian UTC+7:
+
+```text
+<year>-<month>-<day>-<hour>-<minute>/<namespace>-<service>
+2026-10-08-13-30/ghub-website-merchant-portal-client
+```
+
+Branch phải hợp lệ và chưa tồn tại ở local hoặc origin. Nếu trùng trong cùng
+phút, bot báo lỗi; có thể bấm Yes lại ở phút kế tiếp.
+
+Commit chỉ chứa `group_vars/gitlab-ghub`, với thông điệp:
+
+```text
+gitlab-repo: Grant role <role> for <user> to repo <namespace>/<service>
+gitlab-repo: Grant role developer for tuanpv to repo ghub-website/merchant-portal-client
+```
+
+Các lệnh Git chính tương ứng:
+
+```bash
+git switch -c <branch>
+git add -- group_vars/gitlab-ghub
+git commit -m "gitlab-repo: Grant role <role> for <user> to repo <namespace>/<service>" -- group_vars/gitlab-ghub
+git push --set-upstream origin <branch>
+# Tìm/tạo MR bằng GitLab API, target_branch=master.
+git switch master
+git pull --ff-only origin master
+```
+
+Lệnh commit đặt `user.name` riêng bằng `GITLAB_USERNAME` (fallback `infra-bot`)
+và `user.email=<author>@<GitLab host>` qua `git -c`; không cần cấu hình author
+toàn cục trong container. Push dùng credential helper hiện có, không force push.
+
+MR được tạo trong project Ansible do `GITLAB_PROJECT_ID` xác định, với source
+là branch vừa push và target là `master`. Mô tả ghi đúng lệnh Ghub, commit,
+Telegram user ID và PLAY RECAP. Client tìm MR đang mở cùng source/target trước
+khi tạo và đặt `remove_source_branch=true`.
+
+Sau khi push thành công, backend luôn thử trở về `master` và pull, kể cả khi
+API MR lỗi. MR được mở để review, không tự merge. YAML mới vào `master` sau
+khi MR được merge; việc switch về YAML trên `master` không chạy lại Ansible
+và không huỷ quyền đã áp dụng. Nên hoàn tất merge MR trước lượt thay đổi tiếp
+theo cho cùng service để preview phản ánh cấu hình đã chấp nhận.
+
+## Lỗi cuối luồng và thử lại
+
+`Finalization` giữ `action`, `branch`, `commit`, `pushed`, `mr_url` và
+`restored` trong phiên để tiếp tục từ bước đã hoàn tất.
+
+| Tình huống | Xử lý khi thử lại |
+| --- | --- |
+| Commit đã tạo nhưng push lỗi | Giữ branch/commit; thử lại push và MR. |
+| Push thành công nhưng API MR lỗi | Giữ branch/commit đã push; tìm/tạo lại MR, không chạy lại Ansible. |
+| MR đã tạo nhưng switch/pull lỗi | Giữ URL MR; thử lại bước cập nhật `master`. |
+| No đã phục hồi YAML nhưng Ansible lỗi | Chạy lại playbook với YAML cũ. |
+| No đã chạy lại Ansible thành công nhưng pull lỗi | Thử lại cập nhật `master`, không chạy lại playbook. |
+| Repo bị sửa ngoài dự kiến | Báo lỗi; giữ dữ liệu, không reset hoặc ghi đè thay đổi khác. |
+
+Lỗi ở bước hoàn tất giữ phiên và khóa. Sau khi Yes đã tạo branch hoặc No đã
+bắt đầu áp dụng cấu hình cũ, bot chỉ hiện nút tương ứng để thử lại lựa chọn đó.
+Lỗi trước khi bắt đầu một lựa chọn vẫn có thể hiển thị hai nút. Nếu menu bị
+mất hoặc gửi Telegram lỗi, người mở phiên có thể dùng `/gitlab` hoặc `/cancel`
+để hiển thị lại khi phiên đang chờ quyết định.
+
+Phiên và trạng thái thử lại nằm trong bộ nhớ, không được phục hồi sau restart.
+Checkout có thay đổi local vẫn làm startup dừng để giữ dữ liệu. Khi bị gián
+đoạn giữa commit/push/MR, cần kiểm tra branch, remote, MR và quyền thực tế trước
+khi tiếp tục; không giả định bot tự khôi phục phiên cũ.
 
 ## Cài vào infra-bot
 
-Giải nén gói ZIP rồi áp dụng patch tại thư mục gốc infra-bot:
+Đưa các thay đổi code vào `gitlab_access.py`, `gitlab_conversation.py` và
+`workflow.py`, rồi build image tại thư mục gốc infra-bot:
 
 ```bash
-git apply --check /path/to/infra-bot-gitlab.patch
-git apply /path/to/infra-bot-gitlab.patch
-docker build -t infra-ansible-bot:gitlab-flow .
+docker build -t infra-ansible-bot:gitlab-role-mr .
 ```
 
 Giữ các biến hiện có trong `/mnt/secrets/.env`; đặt:
@@ -142,11 +266,13 @@ Giữ các biến hiện có trong `/mnt/secrets/.env`; đặt:
 ```dotenv
 GIT_TARGET_BRANCH=master
 GIT_CLONE_DIR=/app/infra
+GITLAB_PROJECT_ID=devops/ansible/infra
 ```
 
-Hai module mới được COPY vào image và PyYAML 6.0.1 được cài từ requirements.
-Các biến xác thực GitLab và Telegram vẫn dùng cấu hình hiện tại. Không cần biến
-môi trường mới cho luồng `/gitlab`.
+Các module đã được COPY vào image và PyYAML 6.0.1 được cài từ requirements.
+Giữ cấu hình xác thực GitLab/Telegram hiện có; token cần quyền đọc/push repo
+Ansible và quyền API tìm/tạo MR trong project đó. Không cần biến môi trường
+mới cho bước quyết định cuối. `/mnt/secrets/.env` vẫn được Python nạp khi startup.
 
 Startup clone trên branch đã cấu hình; checkout hiện có được cập nhật bằng
 checkout branch và merge `--ff-only`, thay cho detached HEAD. Repo có diff
@@ -155,14 +281,21 @@ HTTP `/health` giữ hành vi hiện có.
 
 ## Kiểm chứng
 
-```bash
-python -m pip install 'python-telegram-bot==20.7' 'PyYAML==6.0.1'
-python -m unittest discover -s tests -v
-```
+Đợt kiểm chứng thay đổi đã qua 16 kiểm tra local: dùng Git thật trong repo tạm,
+executable Ansible giả ghi argv/cwd/nội dung YAML và GitLab/Bot API mô phỏng.
+Bao gồm Yes/No, lỗi push/MR/pull, thử lại cùng branch/commit, thay đổi ngoài dự
+kiến, nút cũ/người khác, khóa phiên, tham số MR mặc định của `/run` và cú pháp
+Python 3.8. Các kiểm tra này không xác minh quyền trên GitLab thật.
 
-Test dùng Git thật trong repo tạm, executable Ansible giả để ghi argv/cwd, và
-Bot API giả trong bộ nhớ. Bao gồm nhánh Yes/No, các role, chuyển role, nút cũ,
-người khác bấm nút, quyền Telegram, khóa chạy chung, diff ngoài dự kiến,
-thay đổi sau preview, startup branch và regression của `/run`.
-Không kết nối Telegram/GitLab thật hoặc chạy playbook infra thật trong kiểm thử.
-Việc áp dụng quyền lên GitLab còn cần kiểm tra tại container của bạn.
+Kiểm tra tại container trên service thử nghiệm:
+
+1. No trước Ansible: file và quyền không thay đổi.
+2. Yes trước Ansible: kiểm tra Git status/diff, argv và PLAY RECAP.
+3. Yes cuối: kiểm tra tên branch, commit chỉ đổi file YAML, tiêu đề/source/target
+   MR, working tree sạch và `master` đã pull.
+4. No cuối: kiểm tra YAML cũ được ghi trước khi chạy lại playbook, role cũ được
+   phục hồi; user ban đầu chưa có quyền phải được thu hồi membership mới.
+5. Kiểm tra nút cũ/người khác, `/gitlab` và `/cancel` khi chờ quyết định, cùng
+   việc `/run` bị chặn trong thời gian đó.
+6. Mô phỏng lỗi push, API MR, pull hoặc playbook phục hồi; kiểm tra nút thử lại,
+   không tạo thêm commit/MR và chỉ nhả khóa sau khi hoàn tất.
