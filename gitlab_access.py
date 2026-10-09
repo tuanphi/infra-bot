@@ -392,8 +392,8 @@ class GitLabAccessWorkflow:
         if not state.branch:
             self._require_files()
             self._validate_change(change, self.report())
-            stamp = datetime.now(timezone(timedelta(hours=7))).strftime("%Y%m%d")
-            branch = "[bot]%s/%s/%s" % (stamp, request.namespace, request.service)
+            stamp = datetime.now(timezone(timedelta(hours=7))).strftime("%Y%m%d-%H%M%S")
+            branch = "bot-%s/%s/%s" % (stamp, request.namespace, request.service)
             self._git_output("check-ref-format", "--branch", branch)
             local = self._git_output("for-each-ref", "--format=%(refname)", "refs/heads/" + branch)
             remote = self._git_output("ls-remote", "--heads", "origin", "refs/heads/" + branch)
