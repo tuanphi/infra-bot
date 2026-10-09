@@ -168,6 +168,14 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
             await clear_session(update, ctx)
             return ConversationHandler.END
         session["request"] = request
+        if request.mode == "unchanged":
+            await reply_full(
+                update.effective_message,
+                "✅ %s đã có role %s tại %s/%s. YAML và GitLab đã khớp."
+                % (request.username, request.role, request.namespace, request.service),
+            )
+            await clear_session(update, ctx)
+            return ConversationHandler.END
         status = ("user %s đang có role %s (GitLab API)"
                   % (request.username, ", ".join(request.current_roles))
                   if request.current_roles else
@@ -178,13 +186,15 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
                 request.access.access_level if request.access.access_level is not None else "none",
                 request.access.expires_at or "none",
             )
+        notice = ("🔄 YAML đã đúng; sẽ đồng bộ quyền trên GitLab." if request.mode == "sync" else
+                  "📝 Sẽ cập nhật YAML và chạy Ansible.")
         keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton("Yes", callback_data="gitlab:%s:confirm:yes" % session["nonce"]),
             InlineKeyboardButton("No", callback_data="gitlab:%s:confirm:no" % session["nonce"]),
         ]])
         message = await update.effective_message.reply_text(
-            "%s\nNamespace: %s\nService: %s\nRole được chọn: %s\n\nBạn có muốn thực hiện thay đổi?"
-            % (status, request.namespace, request.service, request.role), reply_markup=keyboard,
+            "%s\nNamespace: %s\nService: %s\nRole được chọn: %s\n\n%s\nBạn có muốn tiếp tục?"
+            % (status, request.namespace, request.service, request.role, notice), reply_markup=keyboard,
         )
         session["menu_id"] = message.message_id
         return CONFIRM
@@ -242,13 +252,29 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
             playbook_started = False
             try:
                 change = await backend(workflow.prepare, request)
+                if change.mode == "unchanged":
+                    await reply_full(
+                        message,
+                        "✅ %s đã có role %s tại %s/%s. YAML và GitLab đã khớp."
+                        % (request.username, request.role, request.namespace, request.service),
+                    )
+                    return
                 await reply_git_report(message, change.report)
                 await message.reply_text(
-                    "Kiểm tra Git hợp lệ. Đang chạy:\nansible-playbook -i nonprod gitlab-repos-ghub.yaml --tags=%s,project_user_access"
-                    % request.namespace,
+                    "%s\nansible-playbook -i nonprod gitlab-repos-ghub.yaml --tags=%s,project_user_access"
+                    % ("🔄 YAML đã đúng; đang chạy Ansible để đồng bộ GitLab."
+                       if change.mode == "sync" else "📝 Đã cập nhật YAML; đang chạy Ansible.",
+                       request.namespace),
                 )
                 playbook_started = True
                 result = await backend(workflow.run_playbook, change)
+                if change.mode == "sync":
+                    await reply_full(
+                        message,
+                        "✅ Đã đồng bộ quyền.\n%s/%s: %s → %s (GitLab API xác nhận).\n%s"
+                        % (request.namespace, request.service, request.username, request.role, result.recap),
+                    )
+                    return
             except GitCheckError as exc:
                 await reply_git_report(message, exc.report)
                 await reply_full(message, "❌ " + str(exc))

@@ -25,6 +25,7 @@ PLAYBOOK = "gitlab-repos-ghub.yaml"
 INVENTORY = "nonprod"
 REQUIRED_BRANCH = "master"
 ROLES = ("maintainer", "developer", "reporter", "guest")
+ROLE_LEVELS = {"maintainer": 40, "developer": 30, "reporter": 20, "guest": 10}
 SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$")
 USERNAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,254}$")
 
@@ -52,6 +53,7 @@ class AccessRequest:
     source: bytes
     project_path: str = ""
     access: Optional[ProjectUserAccess] = None
+    mode: str = "update"
 
 
 @dataclass(frozen=True)
@@ -74,6 +76,7 @@ class AppliedChange:
     request: AccessRequest
     content: bytes
     report: GitReport
+    mode: str = "update"
 
 
 @dataclass(frozen=True)
@@ -303,13 +306,27 @@ class GitLabAccessWorkflow:
         _access(project, project_node)
         access = self.access_client.project_user_access(project["path"], username)
         roles = (access.role,) if access.role else ()
-        return AccessRequest(
+        request = AccessRequest(
             namespace, service, access.username, role, roles, report.head, source,
             project_path=project["path"], access=access,
         )
+        content = _updated_content(request)
+        mode = self._access_mode(request, content, access)
+        return AccessRequest(
+            namespace, service, access.username, role, roles, report.head, source,
+            project_path=project["path"], access=access, mode=mode,
+        )
+
+    @staticmethod
+    def _access_mode(request, content, access):
+        if content != request.source:
+            return "update"
+        return "unchanged" if access.access_level == ROLE_LEVELS[request.role] else "sync"
 
     def rollback(self, change):
         # Do not overwrite someone else's subsequent edit, or reset other files.
+        if change.mode != "update":
+            return False
         try:
             if not self.path.is_symlink() and self.path.read_bytes() == change.content:
                 _atomic_write(self.path, change.request.source)
@@ -322,6 +339,14 @@ class GitLabAccessWorkflow:
     def _validate_change(self, change, report):
         if report.branch != REQUIRED_BRANCH or report.head != change.request.head:
             raise GitCheckError("Branch/commit đã đổi; dừng trước khi chạy Ansible.", report)
+        if change.mode in ("sync", "unchanged"):
+            if (report.porcelain or report.diff.strip() or self.path.is_symlink()
+                    or self.path.read_bytes() != change.request.source
+                    or change.content != change.request.source):
+                raise GitCheckError("Repo/YAML đã đổi; dừng trước khi đồng bộ quyền GitLab.", report)
+            return
+        if change.mode != "update":
+            raise WorkflowError("Trường hợp cập nhật quyền không hợp lệ.")
         if report.porcelain != " M " + ACCESS_FILE + "\x00":
             raise GitCheckError("Git status có thay đổi ngoài file dự kiến hoặc có thay đổi staged; dừng luồng.", report)
         if not report.diff.strip() or self.path.is_symlink() or self.path.read_bytes() != change.content:
@@ -333,11 +358,13 @@ class GitLabAccessWorkflow:
             raise GitCheckError("Cấu hình đã đổi sau khi chọn role; chạy /gitlab lại để xác nhận thông tin mới.", report)
         content = _updated_content(request)
         if content == request.source:
-            raise GitCheckError(
-                "YAML đã chứa user %s ở role %s; không có diff để chạy Ansible. "
-                "Nếu role trên GitLab khác YAML, cần đồng bộ lại bằng playbook."
-                % (request.username, request.role), report,
-            )
+            # Re-read membership after Yes; the live role may have changed since preview.
+            access = self.access_client.project_user_access(request.project_path, request.username)
+            if request.access is not None and access.user_id != request.access.user_id:
+                raise WorkflowError("User GitLab đã đổi sau xác nhận; chạy /gitlab lại.")
+            change = AppliedChange(request, content, report, self._access_mode(request, content, access))
+            self._validate_change(change, self.report())
+            return change
         change = AppliedChange(request, content, report)
         _atomic_write(self.path, content)
         try:
@@ -349,6 +376,8 @@ class GitLabAccessWorkflow:
         return AppliedChange(request, content, report)
 
     def run_playbook(self, change):
+        if change.mode == "unchanged":
+            raise WorkflowError("YAML và GitLab đã đúng role; không cần chạy Ansible.")
         # Recheck after sending the complete Git outputs to Telegram.
         try:
             self._require_files()
@@ -356,9 +385,30 @@ class GitLabAccessWorkflow:
         except Exception:
             self.rollback(change)
             raise
-        return self._run_access_playbook(
-            change.request, "Giữ diff YAML để kiểm tra; Ansible có thể đã áp dụng một phần.",
+        result = self._run_access_playbook(
+            change.request,
+            "YAML không thay đổi; cần kiểm tra quyền GitLab đã áp dụng."
+            if change.mode == "sync" else
+            "Giữ diff YAML để kiểm tra; Ansible có thể đã áp dụng một phần.",
         )
+        if change.mode == "sync":
+            self._validate_change(change, self.report())
+            try:
+                access = self.access_client.project_user_access(
+                    change.request.project_path, change.request.username,
+                )
+            except WorkflowError as exc:
+                raise WorkflowError("Ansible đã chạy nhưng chưa xác minh được quyền GitLab.\n%s" % exc) from exc
+            if (change.request.access is not None
+                    and access.user_id != change.request.access.user_id):
+                raise WorkflowError("Ansible đã chạy nhưng user GitLab đã đổi; cần kiểm tra lại.")
+            if access.access_level != ROLE_LEVELS[change.request.role]:
+                raise WorkflowError(
+                    "Ansible đã chạy nhưng GitLab vẫn là %s (access_level: %s); cần role %s (%s)."
+                    % (access.role or "chưa có membership", access.access_level,
+                       change.request.role, ROLE_LEVELS[change.request.role]),
+                )
+        return result
 
     def _run_access_playbook(self, request, failure_note):
         args = (
@@ -386,6 +436,8 @@ class GitLabAccessWorkflow:
         self._require_clean()
 
     def prepare_branch(self, change, state):
+        if change.mode != "update":
+            raise WorkflowError("Không có thay đổi YAML để tạo branch.")
         if state.action == "no" or state.push_confirmed:
             raise WorkflowError("Lượt hiện tại đã bắt đầu huỷ hoặc đã xác nhận push.")
         request = change.request
@@ -398,7 +450,7 @@ class GitLabAccessWorkflow:
             local = self._git_output("for-each-ref", "--format=%(refname)", "refs/heads/" + branch)
             remote = self._git_output("ls-remote", "--heads", "origin", "refs/heads/" + branch)
             if local.strip() or remote.strip():
-                raise WorkflowError("Branch %s đã tồn tại; bấm Yes lại ở phút kế tiếp." % branch)
+                raise WorkflowError("Branch %s đã tồn tại; bấm Yes lại ở giây kế tiếp." % branch)
             self._git_output("checkout", "-b", branch)
             state.branch = branch
             state.action = "yes"
@@ -504,6 +556,8 @@ class GitLabAccessWorkflow:
         self._return_master()
 
     def finalize(self, change, answer, state, review=None):
+        if change.mode != "update":
+            raise WorkflowError("Lượt đồng bộ quyền không có bước push branch hoặc huỷ YAML.")
         if answer not in ("yes", "no"):
             raise WorkflowError("Lựa chọn không hợp lệ.")
         if state.action == "no" and answer != "no":
