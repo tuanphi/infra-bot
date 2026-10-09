@@ -1,24 +1,25 @@
 # Luồng /gitlab
 
 Tài liệu mô tả luồng `/gitlab` với quyết định Yes/No sau Ansible và xác nhận
-thông tin MR trước khi push và tra role qua GitLab REST API, dựa trên source
-`master` ở commit `602b352` của
+thông tin branch trước khi push và tra role qua GitLab REST API, dựa trên source
+`master` ở commit `a8f9abb` của
 `tuanphi/infra-bot`. Các lệnh chuyển nhánh dùng `git checkout` để tương thích
 với Git trong container chưa hỗ trợ `git switch`.
 `gitlab_conversation.py` quản lý hội thoại; `gitlab_access.py` sửa YAML, chạy
-playbook và hoàn tất thay đổi; `workflow.py` cung cấp Git helper và GitLab MR
-client đọc membership và tạo MR. Luồng `/run <source-branch>` vẫn dùng source đã commit/push từ trước.
+playbook và hoàn tất thay đổi; `workflow.py` cung cấp Git helper và GitLab
+client đọc membership. `/gitlab` chỉ push branch; API tạo MR chỉ còn dùng bởi
+`/run`. Luồng `/run <source-branch>` vẫn dùng source đã commit/push từ trước.
 
 ## Hội thoại
 
 ```mermaid
 flowchart TD
-    A["Ansible thành công"] --> B{"Chuẩn bị MR hay huỷ thay đổi?"}
+    A["Ansible thành công"] --> B{"Chuẩn bị branch hay huỷ thay đổi?"}
     B -->|Yes| D["Tạo branch và commit local"]
     D -->|Thành công| E{"Xem branch, difference, commit; xác nhận push?"}
     B -->|No| C["Phục hồi YAML; chạy lại Ansible"]
     E -->|No| C
-    E -->|Yes| F["Push branch; tìm hoặc tạo MR"]
+    E -->|Yes| F["Push branch lên origin"]
     F -->|Thành công| G["Checkout master; pull ff-only"]
     C -->|Thành công| G
     G -->|Thành công| H["Kết thúc phiên; nhả khóa"]
@@ -61,16 +62,16 @@ flowchart TD
 8. Ansible exit 0 → bot gửi kết quả và PLAY RECAP, sau đó hiển thị:
 
    ```text
-   Yes: Tạo merge request đẩy lên nhánh master / No: Huỷ thay đổi
+   Yes: Tạo và đẩy branch lên repo / No: Huỷ thay đổi
    ```
 
    Tin nhắn có hai nút **Yes** và **No**. Đây là quyết định sau khi quyền đã
    được áp dụng qua playbook, khác bước xác nhận trước khi chạy Ansible.
 9. **Yes** → tạo branch và commit riêng file YAML tại local, rồi hiển thị
-   **Thông tin merge request** gồm branch, difference, commit SHA và commit message.
+   **Thông tin branch trước khi push** gồm branch, difference, commit SHA và commit message.
    **No** → phục hồi YAML trước khi sửa và chạy lại cùng playbook/cùng namespace.
-10. Sau thông tin MR, bot hỏi **Bạn có muốn push branch và tạo merge request
-    không?** với hai nút Yes/No. Yes mới cho phép push và tìm/tạo MR vào `master`.
+10. Sau thông tin branch, bot hỏi **Bạn có muốn đẩy branch lên repo không?**
+    với hai nút Yes/No. Yes mới cho phép push branch lên `origin`; không tạo MR.
     No chuyển sang cùng backend huỷ thay đổi ở bước 9, kể cả khi đã tạo commit local.
 11. Sau khi hoàn tất lựa chọn, bot chạy `git checkout master` và
     `git pull --ff-only origin master`, gửi kết quả, xoá phiên và nhả khóa.
@@ -79,7 +80,7 @@ Chỉ Telegram user thuộc `ALLOWED_USER_IDS`, trong `ALLOWED_GROUP_ID`, mới 
 đi qua luồng. Nút của người khác, nút của phiên cũ hoặc nút đã xác nhận không
 thể áp dụng lại yêu cầu. Phiên được đối chiếu theo chat, user, nonce và message ID.
 Ba bước xác nhận dùng callback riêng: trước Ansible là `:confirm:`, sau
-Ansible là `:final:`, và xác nhận push sau khi xem thông tin MR là `:push:`.
+Ansible là `:final:`, và xác nhận push sau khi xem thông tin branch là `:push:`.
 
 `/gitlab` có thể khởi tạo lại phiên trước khi xác nhận. Sau khi xác nhận Yes
 lần đầu, `/cancel` không huỷ tác vụ đang chạy. Khi đang chờ quyết định sau
@@ -193,7 +194,7 @@ ansible-playbook -i nonprod gitlab-repos-ghub.yaml --tags=ghub-website,project_u
 `ghub-website` được thay bằng namespace đã chọn. Không ghép shell command từ
 nội dung người dùng. Khóa `run_lock` dùng chung với `/run` được giữ từ lúc
 xác nhận Yes lần đầu, qua chạy Ansible, chờ quyết định sau Ansible, xem thông
-tin MR, chờ xác nhận push và hoàn tất lựa chọn.
+tin branch, chờ xác nhận push và hoàn tất lựa chọn.
 Trong thời gian này, lượt `/run` hoặc `/gitlab` khác không thể sử dụng repo.
 Chỉ triển khai một replica cho Telegram polling; khóa này chỉ có hiệu lực
 trong một process.
@@ -210,7 +211,7 @@ khóa vẫn do phiên giữ, không cần một task chờ vô hạn.
 
 Ansible lần đầu exit khác 0 hoặc timeout: bot báo lỗi, giữ diff để kiểm tra vì
 playbook có thể đã áp dụng một phần, kết thúc phiên và nhả khóa. Trường hợp
-này không hiện menu tạo MR/huỷ thay đổi và cần người vận hành kiểm tra trước
+này không hiện menu push branch/huỷ thay đổi và cần người vận hành kiểm tra trước
 lượt `/gitlab` tiếp theo.
 
 ## Quyết định No sau Ansible
@@ -221,7 +222,7 @@ và giữ dữ liệu để kiểm tra.
 
 Thứ tự xử lý:
 
-1. Nếu đã tạo branch/commit local để xem MR, kiểm tra bản nháp còn nguyên và
+1. Nếu đã tạo branch/commit local để xem thông tin branch, kiểm tra bản nháp còn nguyên và
    local `master` vẫn ở commit đã preview, rồi `git checkout master` để lấy
    lại YAML gốc. Nếu chuẩn bị dừng sau `git add`, backend bỏ staging riêng file
    YAML và phục hồi nội dung trước khi checkout; không reset toàn repo.
@@ -241,7 +242,7 @@ thử lại chỉ tiếp tục bước cập nhật `master`.
 
 No sau Ansible và No tại menu xác nhận push đều gọi `_cancel_change()`.
 Branch/commit đã chuẩn bị được giữ tại local để kiểm tra; lượt bị huỷ không
-push branch hoặc gọi API tạo MR. Nếu local `master` hoặc bản nháp bị thay đổi
+push branch. Nếu local `master` hoặc bản nháp bị thay đổi
 ngoài dự kiến, backend báo lỗi và giữ dữ liệu để người vận hành kiểm tra.
 
 Phục hồi YAML và Ansible exit 0 không tự chứng minh membership trên GitLab đã
@@ -254,9 +255,9 @@ ban đầu; quyền kế thừa từ group cũng không bị giảm bởi việc
 ## Yes sau Ansible: chuẩn bị branch và commit
 
 Backend kiểm tra lại Git và nội dung file trước khi tạo branch/commit bằng
-`prepare_merge_request()`. Bước này trả `MergeRequestInfo` cho hội thoại và
+`prepare_branch()`. Bước này trả `BranchPushInfo` cho hội thoại và
 chờ người dùng xác nhận push.
-Tên branch và tiêu đề MR có cùng mẫu, dùng thời gian UTC+7:
+Tên branch dùng thời gian UTC+7:
 
 ```text
 <year>-<month>-<day>-<hour>-<minute>/<namespace>-<service>
@@ -285,14 +286,13 @@ Lệnh commit đặt `user.name` riêng bằng `GITLAB_USERNAME` (fallback `infr
 và `user.email=<author>@<GitLab host>` qua `git -c`; không cần cấu hình author
 toàn cục trong container. Push dùng credential helper hiện có, không force push.
 
-## Thông tin merge request và xác nhận push
+## Thông tin branch và xác nhận push
 
 Bot gửi đầy đủ thông tin, chia thành nhiều tin nhắn nếu vượt giới hạn Telegram:
 
 ```text
-Thông tin merge request
+Thông tin branch trước khi push
 Branch: 2026-10-08-13-30/ghub-website-merchant-portal-client
-Target: master
 Commit: <commit SHA>
 Commit message: gitlab-repo: Grant role developer for tuanpv to repo ghub-website/merchant-portal-client
 
@@ -308,47 +308,46 @@ working tree và nội dung file được kiểm tra trước khi hiển thị.
 Sau thông tin, bot hiện:
 
 ```text
-Bạn có muốn push branch và tạo merge request không?
-Yes: Push và tạo MR / No: Huỷ thay đổi
+Bạn có muốn đẩy branch lên repo không?
+Yes: Push branch / No: Huỷ thay đổi
 ```
 
 - **Yes:** kiểm tra lại branch, diff, SHA và commit message khớp chính xác
-  `MergeRequestInfo` đã hiển thị; đánh dấu đã xác nhận push rồi mới push/tạo MR.
+  `BranchPushInfo` đã hiển thị; đánh dấu đã xác nhận push rồi mới push branch.
 - **No:** gọi cùng luồng phục hồi YAML/chạy lại Ansible như No sau Ansible.
 
 Các bước sau xác nhận Yes tương ứng:
 
 ```bash
 git push --set-upstream origin <branch>
-# Tìm/tạo MR bằng GitLab API, target_branch=master.
 git checkout master
 git pull --ff-only origin master
 ```
 
-MR được tạo trong project Ansible do `GITLAB_PROJECT_ID` xác định, với source
-là branch vừa push và target là `master`. Mô tả ghi đúng lệnh Ghub, commit,
-Telegram user ID và PLAY RECAP. Client tìm MR đang mở cùng source/target trước
-khi tạo và đặt `remove_source_branch=true`.
+`_publish_change()` kiểm tra thông tin đã duyệt, chạy `git push --set-upstream`
+và checkout/pull về `master`. Không gọi `create_or_get_mr()` trong `/gitlab`.
+Thành công: bot gửi branch, commit, xoá phiên và nhả khóa. Branch remote được giữ
+để người vận hành xử lý tiếp; không có MR tự động và không có thay đổi trực tiếp
+vào `master`. Checkout/pull không chạy lại Ansible và không huỷ quyền đã áp dụng.
+Cần đồng bộ YAML trong `master` trước lượt tiếp theo cho cùng service.
 
-Sau khi push thành công, backend luôn thử trở về `master` và pull, kể cả khi
-API MR lỗi. MR được mở để review, không tự merge. YAML mới vào `master` sau
-khi MR được merge; việc checkout về YAML trên `master` không chạy lại Ansible
-và không huỷ quyền đã áp dụng. Nên hoàn tất merge MR trước lượt thay đổi tiếp
-theo cho cùng service để preview phản ánh cấu hình đã chấp nhận.
+Các tên trong backend: `prepare_branch()` chuẩn bị branch/commit;
+`branch_push_info()` trả `BranchPushInfo`; `finalize()` nhận change, lựa chọn,
+trạng thái và bản thông tin đã duyệt. `show_branch_review()` trong hội thoại
+hiển thị bản này; phiên lưu ở `push_preview`.
 
 ## Lỗi cuối luồng và thử lại
 
 `Finalization` giữ `action`, `branch`, `commit`, `push_confirmed`, `pushed`,
-`mr_url` và `restored` trong phiên để tiếp tục từ bước đã hoàn tất.
-`MergeRequestInfo` giữ branch, difference, SHA và commit message đã hiển thị.
+`restored` trong phiên để tiếp tục từ bước đã hoàn tất.
+`BranchPushInfo` giữ branch, difference, SHA và commit message đã hiển thị.
 
 | Tình huống | Xử lý khi thử lại |
 | --- | --- |
-| Chuẩn bị branch/commit lỗi, chưa xác nhận push | Thử lại Yes để chuẩn bị/xem MR, hoặc No để phục hồi. |
-| Đã tạo commit, đang chờ xác nhận push | Giữ khóa; Yes push/MR hoặc No chạy luồng huỷ. |
-| Đã xác nhận push nhưng push lỗi | Giữ branch/commit và thông tin đã duyệt; thử lại Yes để push/MR. |
-| Push thành công nhưng API MR lỗi | Giữ branch/commit đã push; tìm/tạo lại MR, không chạy lại Ansible. |
-| MR đã tạo nhưng checkout/pull lỗi | Giữ URL MR; thử lại bước cập nhật `master`. |
+| Chuẩn bị branch/commit lỗi, chưa xác nhận push | Thử lại Yes để chuẩn bị/xem branch, hoặc No để phục hồi. |
+| Đã tạo commit, đang chờ xác nhận push | Giữ khóa; Yes push branch hoặc No chạy luồng huỷ. |
+| Đã xác nhận push nhưng push lỗi | Giữ branch/commit và thông tin đã duyệt; thử lại Yes để push branch. |
+| Branch đã push nhưng checkout/pull lỗi | Giữ branch/commit remote; thử lại cập nhật `master`, không push lại. |
 | No đã phục hồi YAML nhưng Ansible lỗi | Chạy lại playbook với YAML cũ. |
 | No đã chạy lại Ansible thành công nhưng pull lỗi | Thử lại cập nhật `master`, không chạy lại playbook. |
 | Repo bị sửa ngoài dự kiến | Báo lỗi; giữ dữ liệu, không reset hoặc ghi đè thay đổi khác. |
@@ -358,11 +357,11 @@ có thể chọn No dù đã tạo branch/commit local. Khi đã xác nhận pus
 xử lý remote, bot chỉ hiện **Yes** để thử lại cùng thông tin đã duyệt; khi đã
 bắt đầu phục hồi, bot chỉ hiện **No** để thử lại. Nếu menu bị mất hoặc gửi
 Telegram lỗi, `/gitlab` hoặc `/cancel` của người mở phiên hiển thị lại menu
-phù hợp; ở bước xem MR, bot gửi lại cả thông tin và nút xác nhận push.
+phù hợp; ở bước xem branch, bot gửi lại cả thông tin và nút xác nhận push.
 
 Phiên và trạng thái thử lại nằm trong bộ nhớ, không được phục hồi sau restart.
 Checkout có thay đổi local vẫn làm startup dừng để giữ dữ liệu. Khi bị gián
-đoạn giữa commit/push/MR, cần kiểm tra branch, remote, MR và quyền thực tế trước
+đoạn giữa commit/push, cần kiểm tra branch, remote và quyền thực tế trước
 khi tiếp tục; không giả định bot tự khôi phục phiên cũ.
 
 ## Cài vào infra-bot
@@ -396,33 +395,30 @@ HTTP `/health` giữ hành vi hiện có.
 
 ## Kiểm chứng
 
-Đợt này đã qua 21 kiểm tra: 16 trường hợp mới về REST API, preview và hội thoại,
-5 trường hợp `/run`/MR có sẵn. Kiểm tra API dùng phản hồi mô phỏng, Git dùng
-repo thật trong thư mục tạm. Bao gồm API khác YAML, ánh xạ mức quyền, username
-chuẩn, user không tồn tại, membership 404, project không đọc được, token
-401/403, JSON sai, timeout và thông báo lỗi không lộ token.
+Luồng `/gitlab` chỉ push branch đã qua 27 kiểm tra local dùng Git thật,
+role API/Ansible/Telegram mô phỏng. Bao gồm ba menu xác nhận, chưa push trước
+duyệt, branch/commit đúng mẫu, remote trỏ đúng commit, No sau commit local,
+diff đầy đủ, Git không hỗ trợ `switch`, lỗi push/checkout/pull và thử lại,
+bảo vệ thay đổi khác, nút cũ/người khác và khóa phiên. Trong các kiểm tra này,
+`create_or_get_mr()` được đặt để báo lỗi nếu gọi; số lời gọi thực tế bằng 0.
 
-28 trường hợp hồi quy sau Ansible cũng đã qua, dùng API đọc role mô phỏng:
-ba menu xác nhận, chưa push trước duyệt, No sau commit local, diff đầy đủ,
-Git không hỗ trợ `switch`, lỗi push/MR/checkout/pull và thử lại, bảo vệ thay đổi
-khác, nút cũ/người khác và khóa phiên. Các module mới đã kiểm tra cú pháp
-Python 3.8; runtime kiểm tra local dùng Python 3.12. Chưa xác minh trên
-GitLab nội bộ thật.
+Năm kiểm tra `/run`/MR hiện có cũng qua. Cú pháp Python 3.8 đã được kiểm tra,
+runtime kiểm tra local dùng Python 3.12. Chưa xác minh trên GitLab nội bộ thật.
 
 Kiểm tra tại container trên service thử nghiệm:
 
 1. No trước Ansible: file và quyền không thay đổi.
 2. Yes trước Ansible: kiểm tra Git status/diff, argv và PLAY RECAP.
 3. Yes sau Ansible: kiểm tra branch/commit local và toàn bộ difference được
-   hiển thị; branch chưa có trên remote, chưa có MR cho lượt này.
-4. Yes xác nhận push: kiểm tra commit đúng bản đã xem, tiêu đề/source/target
-   MR, working tree sạch và `master` đã checkout/pull.
+   hiển thị; branch chưa có trên remote.
+4. Yes xác nhận push: kiểm tra branch remote trỏ đúng commit đã xem, working
+   tree sạch và `master` đã checkout/pull; xác nhận không gọi API tạo MR.
 5. No sau Ansible hoặc No tại menu push: kiểm tra YAML cũ có trước khi chạy
    lại playbook, role cũ được
    phục hồi; user ban đầu chưa có quyền phải được thu hồi membership mới.
 6. Kiểm tra nút cũ/người khác, `/gitlab` và `/cancel` khi chờ quyết định/xác
    nhận push, cùng
    việc `/run` bị chặn trong thời gian đó.
-7. Mô phỏng lỗi chuẩn bị commit, push, API MR, checkout/pull hoặc playbook phục
+7. Mô phỏng lỗi chuẩn bị commit, push, checkout/pull hoặc playbook phục
    hồi; kiểm tra nút thử lại,
-   không tạo thêm commit/MR và chỉ nhả khóa sau khi hoàn tất.
+   không tạo thêm commit hoặc push lại sau khi đã push thành công và chỉ nhả khóa sau khi hoàn tất.

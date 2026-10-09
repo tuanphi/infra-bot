@@ -89,12 +89,11 @@ class Finalization:
     commit: str = ""
     push_confirmed: bool = False
     pushed: bool = False
-    mr_url: str = ""
     restored: bool = False
 
 
 @dataclass(frozen=True)
-class MergeRequestInfo:
+class BranchPushInfo:
     branch: str
     difference: str
     commit: str
@@ -233,11 +232,10 @@ def _atomic_write(path, content):
 
 
 class GitLabAccessWorkflow:
-    def __init__(self, settings, mr_client=None, access_client=None):
+    def __init__(self, settings, access_client=None):
         self.settings = settings
         self.repo = Path(settings.git_clone_dir).resolve()
         self.path = self.repo / ACCESS_FILE
-        self.mr_client = mr_client or GitLabClient(settings)
         self.access_client = access_client or GitLabClient(settings)
 
     def _git_output(self, *args):
@@ -387,15 +385,15 @@ class GitLabAccessWorkflow:
              settings=self.settings, timeout=self.settings.git_clone_timeout_seconds)
         self._require_clean()
 
-    def prepare_merge_request(self, change, state):
+    def prepare_branch(self, change, state):
         if state.action == "no" or state.push_confirmed:
             raise WorkflowError("Lượt hiện tại đã bắt đầu huỷ hoặc đã xác nhận push.")
         request = change.request
         if not state.branch:
             self._require_files()
             self._validate_change(change, self.report())
-            stamp = datetime.now(timezone(timedelta(hours=7))).strftime("%Y-%m-%d-%H-%M")
-            branch = "%s/%s-%s" % (stamp, request.namespace, request.service)
+            stamp = datetime.now(timezone(timedelta(hours=7))).strftime("%Y%m%d")
+            branch = "[bot]%s/%s/%s" % (stamp, request.namespace, request.service)
             self._git_output("check-ref-format", "--branch", branch)
             local = self._git_output("for-each-ref", "--format=%(refname)", "refs/heads/" + branch)
             remote = self._git_output("ls-remote", "--heads", "origin", "refs/heads/" + branch)
@@ -423,12 +421,12 @@ class GitLabAccessWorkflow:
             )
             state.commit = _git(self.repo, "rev-parse", "HEAD", settings=self.settings)
 
-        return self.merge_request_info(change, state)
+        return self.branch_push_info(change, state)
 
-    def merge_request_info(self, change, state):
+    def branch_push_info(self, change, state):
         self._require_files()
         if not state.branch or not state.commit:
-            raise WorkflowError("Chưa chuẩn bị đủ branch và commit để xác nhận MR.")
+            raise WorkflowError("Chưa chuẩn bị đủ branch và commit để xác nhận push.")
         report = self.report()
         branch_head = _git(self.repo, "rev-parse", "refs/heads/" + state.branch, settings=self.settings)
         parent = _git(self.repo, "rev-parse", state.commit + "^", settings=self.settings)
@@ -437,8 +435,8 @@ class GitLabAccessWorkflow:
                 or branch_head != state.commit or parent != change.request.head
                 or paths != ACCESS_FILE + "\x00"
                 or (report.branch == state.branch and self.path.read_bytes() != change.content)):
-            raise GitCheckError("Repo/branch đã đổi sau commit; dừng trước push/MR.", report)
-        return MergeRequestInfo(
+            raise GitCheckError("Repo/branch đã đổi sau commit; dừng trước push.", report)
+        return BranchPushInfo(
             branch=state.branch,
             difference=self._git_output(
                 "diff", "--no-ext-diff", "--no-textconv",
@@ -448,30 +446,22 @@ class GitLabAccessWorkflow:
             message=_git(self.repo, "log", "-1", "--format=%s", state.commit, settings=self.settings),
         )
 
-    def _publish_change(self, change, state, requester, recap, review):
-        if review is None or review != self.merge_request_info(change, state):
-            raise WorkflowError("Thông tin MR không khớp bản đã xem; cần hiển thị và xác nhận lại.")
+    def _publish_change(self, change, state, review):
+        if review is None or review != self.branch_push_info(change, state):
+            raise WorkflowError("Thông tin branch không khớp bản đã xem; cần hiển thị và xác nhận lại.")
         state.push_confirmed = True
-        request = change.request
         try:
             if not state.pushed:
                 self._git_output("push", "--set-upstream", "origin", state.branch)
                 state.pushed = True
-            if not state.mr_url:
-                state.mr_url = self.mr_client.create_or_get_mr(
-                    state.branch, state.commit, requester, recap,
-                    title=state.branch, target_branch=REQUIRED_BRANCH,
-                    command="ansible-playbook -i nonprod %s --tags=%s,project_user_access"
-                    % (PLAYBOOK, request.namespace),
-                )
         finally:
-            # A pushed branch remains available for MR retries after switching back.
+            # Keep the pushed branch and retry only cleanup if returning to master fails.
             if state.pushed:
                 self._return_master()
 
     def _cancel_change(self, change, state):
-        if state.push_confirmed or state.pushed or state.mr_url:
-            raise WorkflowError("Đã xác nhận push; chỉ có thể thử lại Yes để hoàn tất MR.")
+        if state.push_confirmed or state.pushed:
+            raise WorkflowError("Đã xác nhận push; chỉ có thể thử lại Yes để hoàn tất lượt hiện tại.")
         if not state.restored:
             self._require_files()
             report = self.report()
@@ -479,10 +469,10 @@ class GitLabAccessWorkflow:
                 master_head = _git(self.repo, "rev-parse", "refs/heads/" + REQUIRED_BRANCH,
                                    settings=self.settings)
                 if master_head != change.request.head:
-                    raise GitCheckError("Master đã đổi sau khi chuẩn bị MR; giữ dữ liệu để kiểm tra.", report)
+                    raise GitCheckError("Master đã đổi sau khi chuẩn bị branch; giữ dữ liệu để kiểm tra.", report)
                 if state.commit:
                     # A clean local draft can be left intact while restoring master.
-                    self.merge_request_info(change, state)
+                    self.branch_push_info(change, state)
                     state.action = "no"
                 else:
                     # Also allow cancellation if preparation stopped after git add.
@@ -513,15 +503,15 @@ class GitLabAccessWorkflow:
             state.restored = True
         self._return_master()
 
-    def finalize(self, change, answer, requester, recap, state, review=None):
+    def finalize(self, change, answer, state, review=None):
         if answer not in ("yes", "no"):
             raise WorkflowError("Lựa chọn không hợp lệ.")
         if state.action == "no" and answer != "no":
             raise WorkflowError("Đã bắt đầu huỷ; chỉ có thể thử lại No để hoàn tất.")
         if answer == "yes":
             if review is None:
-                return self.prepare_merge_request(change, state)
-            self._publish_change(change, state, requester, recap, review)
+                return self.prepare_branch(change, state)
+            self._publish_change(change, state, review)
         else:
             self._cancel_change(change, state)
         return state

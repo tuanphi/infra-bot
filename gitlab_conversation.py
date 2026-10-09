@@ -11,7 +11,7 @@ from telegram.error import TelegramError
 from telegram.ext import CallbackQueryHandler, CommandHandler, ConversationHandler, MessageHandler, filters
 from telegram.warnings import PTBUserWarning
 
-from gitlab_access import Finalization, GitCheckError, MergeRequestInfo, ROLES, USERNAME
+from gitlab_access import BranchPushInfo, Finalization, GitCheckError, ROLES, USERNAME
 from workflow import WorkflowError
 
 
@@ -205,15 +205,15 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
             ) for answer in choices
         ]])
         text = ("Thử lại %s để hoàn tất lượt hiện tại." % choices[0].title() if len(choices) == 1 else
-                "Yes: Tạo merge request đẩy lên nhánh master / No: Huỷ thay đổi")
+                "Yes: Tạo và đẩy branch lên repo / No: Huỷ thay đổi")
         menu = await message.reply_text(text, reply_markup=keyboard)
         session["menu_id"] = menu.message_id
 
-    async def show_merge_review(message, session):
-        info = session["mr_preview"]
+    async def show_branch_review(message, session):
+        info = session["push_preview"]
         await reply_full(
             message,
-            "Thông tin merge request\nBranch: %s\nTarget: master\nCommit: %s\nCommit message: %s\n\nDifference:\n%s"
+            "Thông tin branch trước khi push\nBranch: %s\nCommit: %s\nCommit message: %s\n\nDifference:\n%s"
             % (info.branch, info.commit, info.message, info.difference),
         )
         keyboard = InlineKeyboardMarkup([[
@@ -221,14 +221,14 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
             for answer in ("yes", "no")
         ]])
         menu = await message.reply_text(
-            "Bạn có muốn push branch và tạo merge request không?\nYes: Push và tạo MR / No: Huỷ thay đổi",
+            "Bạn có muốn đẩy branch lên repo không?\nYes: Push branch / No: Huỷ thay đổi",
             reply_markup=keyboard,
         )
         session.update(menu_id=menu.message_id, stage="review")
 
     async def show_pending_menu(message, session):
         if session.get("stage") == "review":
-            await show_merge_review(message, session)
+            await show_branch_review(message, session)
         else:
             await show_final_menu(message, session)
 
@@ -282,11 +282,11 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
     async def finish_request(update, ctx, session, review=None):
         message = update.effective_message
         if review is None and session["finalization"].push_confirmed:
-            review = session.get("mr_preview")
+            review = session.get("push_preview")
         try:
             state = await backend(
                 workflow.finalize, session["change"], session["answer"],
-                update.effective_user.id, session["recap"], session["finalization"],
+                session["finalization"],
                 review,
             )
         except Exception as exc:
@@ -302,18 +302,18 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
             except TelegramError:
                 logging.exception("Cannot show retry menu; /gitlab can show it again")
             return
-        if isinstance(state, MergeRequestInfo):
-            session["mr_preview"] = state
+        if isinstance(state, BranchPushInfo):
+            session["push_preview"] = state
             try:
-                await show_merge_review(message, session)
+                await show_branch_review(message, session)
             except TelegramError:
                 session["stage"] = "review"
-                logging.exception("Cannot show MR review; /gitlab can show it again")
+                logging.exception("Cannot show branch review; /gitlab can show it again")
             return
         try:
             if state.action == "yes":
-                await reply_full(message, "✅ Đã tạo merge request.\nBranch: %s\nCommit: %s\nMR: %s\nĐã về master và git pull --ff-only."
-                                 % (state.branch, state.commit[:12], state.mr_url))
+                await reply_full(message, "✅ Đã đẩy branch lên repo.\nBranch: %s\nCommit: %s\nĐã về master và git pull --ff-only."
+                                 % (state.branch, state.commit[:12]))
             else:
                 await message.reply_text("✅ Đã phục hồi YAML và chạy lại Ansible với cấu hình cũ.\nĐã về master và git pull --ff-only.")
         except TelegramError:
@@ -363,7 +363,7 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
         if session is None or session.get("stage") != "review":
             return
         answer = update.callback_query.data.rsplit(":", 1)[1]
-        review = session["mr_preview"] if answer == "yes" else None
+        review = session["push_preview"] if answer == "yes" else None
         session.update(answer=answer, stage="finishing", menu_id=None)
         try:
             await update.callback_query.edit_message_reply_markup(reply_markup=None)

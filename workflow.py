@@ -240,14 +240,6 @@ class GitLabClient:
             matches = self._request_json(base + "?" + urlencode(query), headers)
             if matches:
                 return matches[0]["web_url"]
-
-            description = (
-                "Ansible execution passed before opening this MR.\n\n"
-                "Command: `%s`\n"
-                "Commit tested: `%s`\nRequested by Telegram user ID: `%s`\n"
-                "Completed (UTC): %s\n\n```\n%s\n```"
-                % (command, commit, requester, datetime.now(timezone.utc).isoformat(), recap)
-            )
             created = self._request_json(
                 base, headers,
                 payload={
