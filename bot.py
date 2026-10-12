@@ -128,6 +128,7 @@ def build_application(settings):
         if await authorized(update):
             await update.effective_message.reply_text(
                 "Dùng /gitlab để chọn ghub/non-ghub, namespace/service, danh sách user và role chung. "
+                "Dùng /reset để chọn nhóm/namespace, lấy master và chạy lại quyền theo YAML.\n"
                 "Dùng /cancel để dừng trước khi xác nhận.\n"
                 "Dùng /whoami để xem chat_id, user_id và quyền truy cập.\n"
                 "Dùng /run <source-branch> để chạy playbook GitLab trên branch đã commit "

@@ -17,6 +17,8 @@ from workflow import WorkflowError
 
 NAMESPACE, SERVICE, USER, ROLE, CONFIRM = range(5)
 REPOSITORY = 5
+RESET_REPOSITORY, RESET_NAMESPACE = 6, 7
+NAMESPACE_PAGE_SIZE = 12
 SESSION_KEY = "gitlab_access"
 
 
@@ -91,6 +93,122 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
                 )
             except TelegramError:
                 pass
+
+    async def reset_start(update, ctx):
+        if not await authorized(update):
+            return ConversationHandler.END
+        session = get_session(update, ctx)
+        if session and session.get("active"):
+            if session.get("stage") in ("decision", "review"):
+                await show_pending_menu(update.effective_message, session)
+            else:
+                await update.effective_message.reply_text("Lượt hiện tại đang xử lý; vui lòng chờ.")
+            return ConversationHandler.END
+        if run_lock.locked():
+            await update.effective_message.reply_text("Repo đang được xử lý hoặc chờ Yes/No; hoàn tất lượt hiện tại trước khi /reset.")
+            return ConversationHandler.END
+        await clear_session(update, ctx)
+        session = {"nonce": secrets.token_hex(6), "chat_id": update.effective_chat.id, "flow": "reset"}
+        ctx.user_data.setdefault(SESSION_KEY, {})[update.effective_chat.id] = session
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(kind, callback_data="gitlab:%s:resetrepo:%s" % (session["nonce"], kind))
+            for kind in ("ghub", "non-ghub")
+        ]])
+        message = await update.effective_message.reply_text(
+            "♻️ /reset: lấy master và áp dụng lại quyền cho namespace.\nChọn nhóm repo", reply_markup=keyboard,
+        )
+        session["menu_id"] = message.message_id
+        return RESET_REPOSITORY
+
+    async def show_reset_namespaces(message, session, page=0):
+        namespaces = session["namespaces"]
+        pages = (len(namespaces) + NAMESPACE_PAGE_SIZE - 1) // NAMESPACE_PAGE_SIZE
+        page = max(0, min(page, pages - 1))
+        start_index = page * NAMESPACE_PAGE_SIZE
+        buttons = [InlineKeyboardButton(
+            name, callback_data="gitlab:%s:resetns:%s" % (session["nonce"], index),
+        ) for index, name in enumerate(namespaces) if start_index <= index < start_index + NAMESPACE_PAGE_SIZE]
+        rows = [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
+        navigation = []
+        if page:
+            navigation.append(InlineKeyboardButton("⬅️", callback_data="gitlab:%s:resetpage:%s" % (session["nonce"], page - 1)))
+        if page + 1 < pages:
+            navigation.append(InlineKeyboardButton("➡️", callback_data="gitlab:%s:resetpage:%s" % (session["nonce"], page + 1)))
+        if navigation:
+            rows.append(navigation)
+        menu = await message.reply_text(
+            "♻️ Nhóm %s — chọn namespace để chạy /reset (trang %s/%s)." % (session["repo_kind"], page + 1, pages),
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        session["menu_id"] = menu.message_id
+
+    async def reset_repository_input(update, ctx):
+        session = await callback_session(update, ctx)
+        if session is None:
+            return RESET_REPOSITORY
+        repo_kind = update.callback_query.data.rsplit(":", 1)[1]
+        await update.callback_query.edit_message_reply_markup(reply_markup=None)
+        try:
+            namespaces = await backend(workflow.reset_namespaces, repo_kind)
+            if not namespaces:
+                raise WorkflowError("Nhóm %s chưa có namespace chứa service." % repo_kind)
+        except Exception as exc:
+            if not isinstance(exc, WorkflowError):
+                logging.exception("Unexpected /reset namespace lookup failure")
+            await reply_full(update.effective_message, "❌ " + (str(exc) if isinstance(exc, WorkflowError)
+                                                              else "Không đọc được namespace; kiểm tra log bot."))
+            await clear_session(update, ctx)
+            return ConversationHandler.END
+        session.update(repo_kind=repo_kind, namespaces=namespaces, menu_id=None)
+        await show_reset_namespaces(update.effective_message, session)
+        return RESET_NAMESPACE
+
+    async def reset_namespace_input(update, ctx):
+        session = await callback_session(update, ctx)
+        if session is None:
+            return RESET_NAMESPACE
+        action, value = update.callback_query.data.split(":")[-2:]
+        index = int(value)
+        if action == "resetpage":
+            await update.callback_query.edit_message_reply_markup(reply_markup=None)
+            await show_reset_namespaces(update.effective_message, session, index)
+            return RESET_NAMESPACE
+        if index >= len(session["namespaces"]):
+            await update.effective_message.reply_text("Lựa chọn namespace đã hết hạn; chạy /reset lại.")
+            return RESET_NAMESPACE
+        if run_lock.locked():
+            await clear_session(update, ctx)
+            await update.effective_message.reply_text("Repo đang được xử lý hoặc chờ Yes/No; thử /reset lại sau.")
+            return ConversationHandler.END
+        await run_lock.acquire()
+        session.update(active=True, stage="resetting", namespace=session["namespaces"][index], menu_id=None)
+        try:
+            await update.callback_query.edit_message_reply_markup(reply_markup=None)
+        except TelegramError:
+            logging.exception("Cannot remove /reset namespace keyboard")
+        ctx.application.create_task(apply_reset(update, ctx, session), update=update)
+        return ConversationHandler.END
+
+    async def apply_reset(update, ctx, session):
+        message = update.effective_message
+        try:
+            await message.reply_text("🔄 Đang lấy master và chạy Ansible cho %s/%s..."
+                                     % (session["repo_kind"], session["namespace"]))
+            result = await backend(workflow.reset_namespace, session["repo_kind"], session["namespace"])
+            await reply_full(message, "✅ /reset thành công.\nNhóm: %s\nNamespace: %s\nMaster: %s\n%s"
+                             % (result.repo_kind, result.namespace, result.head[:12], result.result.recap))
+        except Exception as exc:
+            if isinstance(exc, GitCheckError):
+                await reply_git_report(message, exc.report)
+            if not isinstance(exc, WorkflowError):
+                logging.exception("Unexpected /reset failure")
+            await reply_full(message, "❌ " + (str(exc) if isinstance(exc, WorkflowError)
+                                              else "Lỗi nội bộ khi /reset; kiểm tra log bot."))
+        finally:
+            try:
+                await clear_session(update, ctx)
+            finally:
+                run_lock.release()
 
     async def start(update, ctx):
         if not await authorized(update):
@@ -460,10 +578,11 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
 
     async def use_buttons(update, ctx):
         if await authorized(update):
-            await update.effective_message.reply_text("Bấm nút ghub/non-ghub, role hoặc Yes/No ở tin nhắn của bot; dùng /cancel để dừng.")
+            await update.effective_message.reply_text("Bấm nút ghub/non-ghub, namespace, role hoặc Yes/No ở tin nhắn của bot; dùng /cancel để dừng.")
 
     async def stale_callback(update, ctx):
-        await update.callback_query.answer("Lựa chọn đã hết hạn hoặc thuộc người khác. Chạy /gitlab để bắt đầu.", show_alert=True)
+        command = "/reset" if ":reset" in update.callback_query.data else "/gitlab"
+        await update.callback_query.answer("Lựa chọn đã hết hạn hoặc thuộc người khác. Chạy %s để bắt đầu." % command, show_alert=True)
 
     text = filters.TEXT & ~filters.COMMAND
     # This flow spans text messages and several inline menus. Track by chat/user;
@@ -476,8 +595,12 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
             message=r"If 'per_message=False', 'CallbackQueryHandler' will not be tracked for every message\..*",
         )
         conversation = ConversationHandler(
-            entry_points=[CommandHandler("gitlab", start)],
+            entry_points=[CommandHandler("gitlab", start), CommandHandler("reset", reset_start)],
             states={
+                RESET_REPOSITORY: [CallbackQueryHandler(reset_repository_input, pattern=r"^gitlab:[0-9a-f]{12}:resetrepo:(ghub|non-ghub)$"),
+                                   MessageHandler(text, use_buttons)],
+                RESET_NAMESPACE: [CallbackQueryHandler(reset_namespace_input, pattern=r"^gitlab:[0-9a-f]{12}:reset(?:ns|page):[0-9]+$"),
+                                  MessageHandler(text, use_buttons)],
                 REPOSITORY: [CallbackQueryHandler(repository_input, pattern=r"^gitlab:[0-9a-f]{12}:repo:(ghub|non-ghub)$"), MessageHandler(text,use_buttons)],              
                 NAMESPACE: [MessageHandler(text, namespace_input)],
                 SERVICE: [MessageHandler(text, service_input)],

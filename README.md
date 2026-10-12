@@ -6,13 +6,13 @@ chọn với quyền thực tế qua GitLab REST API: đã khớp thì kết
 thúc; YAML đúng nhưng API khác thì hỏi Yes/No để chạy Ansible và xác minh lại
 API, không tạo commit/branch. Khi YAML cần thay đổi, bot hỏi Yes/No trước khi sửa
 file trên branch `master`, gửi toàn bộ Git status/diff và chạy
-`ansible-playbook -i nonprod <playbook> --tags=<namespace>,project_user_access`
+`ansible-playbook -i nonprod <playbook> --tags=<namespace>,project_user_access --extra-vars=@group_vars/gitlab-bot`
 khi kiểm tra hợp lệ. Với trường hợp sửa YAML, sau Ansible thành công bot hiện thêm hai nút:
 
 - **Yes:** tạo branch/commit local, hiển thị thông tin branch và hỏi xác nhận push.
 - **No:** phục hồi YAML trước thay đổi và chạy lại playbook với cấu hình cũ.
 
-| Nhóm | File YAML | Playbook |
+| Nhóm | File YAML | Playbook của /gitlab |
 | --- | --- | --- |
 | ghub | `group_vars/gitlab-ghub` | `gitlab-repos-ghub.yaml` |
 | non-ghub | `group_vars/gitlab` | `gitlab-repos.yaml` |
@@ -35,7 +35,7 @@ Ansible thành công:
 ansible-playbook -i nonprod gitlab-repos.yaml --tags=project_user_access
 ```
 
-Telegram hỗ trợ `/gitlab`, `/cancel`, `/run <source-branch>`, `/whoami`, `/id`, `/start` và `/help`.
+Telegram hỗ trợ `/gitlab`, `/reset`, `/cancel`, `/run <source-branch>`, `/whoami`, `/id`, `/start` và `/help`.
 `/whoami` cho biết ID của người gửi và chat để đối chiếu `ALLOWED_USER_IDS`/
 `ALLOWED_GROUP_ID`. Tin nhắn riêng cần `ALLOW_PRIVATE_CHAT=true` và user được
 whitelist; mặc định chỉ dùng trong nhóm đã cấu hình.
@@ -156,6 +156,58 @@ khác, bot cho phép chạy Ansible với YAML hiện có và chỉ báo thành 
 No khôi phục YAML cũ; nếu YAML vốn khác role API, No không đảm bảo khôi phục
 đúng role API trước thay đổi. Chi tiết và bảng mức quyền ở
 [hướng dẫn kiểm tra role](GITLAB-REPO-ROLE-FLOW.md#kiểm-tra-role-bằng-gitlab-rest-api).
+
+## Luồng /reset
+
+1. Gửi `/reset` → chọn **ghub/non-ghub** bằng nút.
+2. Chọn namespace bằng nút; danh sách dài có nút chuyển trang.
+3. Bot giữ khóa chung với `/gitlab` và `/run`, chạy `git checkout master` rồi
+   `git pull --ff-only origin master`. Repo phải sạch; bot giữ các diff chưa
+   hoàn tất để người vận hành xử lý. Local master phải khớp origin/master.
+4. Đọc YAML sau pull, tạo `group_vars/gitlab-bot` chỉ có namespace đã chọn và chạy:
+
+   ```bash
+   ansible-playbook -i nonprod gitlab-repos.yaml --tags=<namespace>,project_user_access --extra-vars=@group_vars/gitlab-bot
+   ```
+
+   `/reset` dùng `gitlab-repos.yaml` cho **cả ghub và non-ghub**. Dữ liệu ghub
+   lấy từ `group_vars/gitlab-ghub`; non-ghub lấy từ `group_vars/gitlab`.
+5. Xoá file tạm, gửi ✅/❌ và thời gian chạy, xoá phiên và nhả khóa. `/reset`
+   áp dụng quyền theo YAML master, không sửa YAML hoặc tạo branch/commit/MR.
+   Ansible exit 0 là kết quả playbook; bước này không đọc lại API cho mọi user.
+
+Chọn namespace bắt đầu chạy ngay. `/cancel` dừng trước bước này; khi Ansible
+đang chạy, bot yêu cầu chờ. Nếu `/gitlab` đang chờ Yes/No, `/reset` hiển thị lại
+menu của lượt đó để hoàn tất trước.
+
+## Giới hạn dữ liệu và đo thời gian Ansible
+
+Các lượt `/gitlab`, huỷ thay đổi bằng No và `/reset` đều tạo file tạm
+`group_vars/gitlab-bot` từ YAML đang áp dụng. Các biến dùng chung được giữ;
+`gitlab_groups` và `gitlab_projects` được lọc đúng namespace. Bot truyền file
+bằng `--extra-vars` và đặt `ANSIBLE_HASH_BEHAVIOUR=replace` cho subprocess để
+các namespace khác không bị gộp lại từ inventory/vars_files.
+
+`/gitlab` và No lọc thêm đúng service đã chọn; `/reset` giữ toàn bộ project
+trong namespace. Với file non-ghub đã cung cấp, `devops` có 9 project trong
+tổng 258: `/gitlab` truyền 1 project; `/reset` chọn devops qua menu truyền 9 project.
+Namespace `qc` không có parent vẫn dùng được.
+File tạm có quyền 0600, không được commit, được xoá sau success, failure và timeout.
+YAML chính vẫn được cập nhật bởi luồng `/gitlab` hiện có: thay đúng membership,
+giữ các namespace khác và giữ diff để xác nhận push. File non-ghub chính là
+`group_vars/gitlab`; ghub là `group_vars/gitlab-ghub`.
+
+Kết quả có tổng thời gian Ansible, số project đã truyền và tối đa 5 task tốn
+thời gian nhất. Callback `ansible_callbacks/bot_timing.py` đo thời gian giữa
+các sự kiện bắt đầu task; thông tin này giúp xác định task/API còn chậm.
+Ví dụ định dạng: `⏱ Ansible: <giây>; namespace devops: 9/258 project.`
+Chưa đo playbook/GitLab nội bộ nên không cam kết thời gian dưới 5 phút.
+
+`--tags=a,b` chọn task khớp một trong hai tag, không tự giới hạn namespace
+trong dữ liệu vòng lặp. Tăng `forks` chủ yếu tăng số host song song; với một
+localhost, cần giảm dữ liệu vòng lặp và xem task timing trước.
+Xem [Ansible variable precedence](https://docs.ansible.com/projects/ansible/latest/playbook_guide/playbooks_variables.html#variable-precedence-where-should-i-put-a-variable)
+và [callback plugins](https://docs.ansible.com/projects/ansible/latest/plugins/callback.html).
 
 ## Luồng /run
 
@@ -293,25 +345,31 @@ không phải project service được cấp quyền. API kiểm tra role dùng 
 `project.path` lấy từ YAML, ví dụ `development/ghub-website/merchant-portal-client`. Với `/gitlab`, đặt
 `GIT_TARGET_BRANCH=master`; branch này phải tồn tại trên GitLab.
 Lệnh chạy không chấp nhận tham số Ansible tùy ý từ Telegram. Để debug, thực
-hiện thủ công trên cùng commit và cùng môi trường; bot chỉ trả về `PLAY RECAP`
-để tránh gửi nội dung task/secret ra Telegram.
+hiện thủ công trên cùng commit và cùng môi trường. Bot trả `PLAY RECAP`,
+thời gian Ansible và tên/thời gian task; không gửi toàn bộ stdout Ansible.
 
 ## Kiểm tra
 
-Ba trường hợp đã qua 16 kiểm tra local: đã có quyền thì kết thúc, đồng bộ với
-YAML sạch và xác minh lại API, API đổi trước Yes, lỗi/mismatch API, lỗi Ansible,
-bảo vệ thay đổi khác, thông báo Telegram và nhả khóa đúng lúc.
-Luồng sửa YAML/push branch đã qua thêm 27 kiểm tra local: branch/commit đúng mẫu,
-không push trước duyệt, không gọi API tạo MR, No sau commit, xác nhận đúng diff,
-khóa phiên, nút cũ/người khác, lỗi push/checkout/pull và thử lại. Git dùng repo
-thật trong thư mục tạm; role API, Ansible và Telegram được mô phỏng.
-Cú pháp Python 3.8 đã được kiểm tra; runtime test dùng
-Python 3.12. Chưa thử trên GitLab nội bộ thật.
+Bộ kiểm tra gồm 39 test trong `tests/test_gitlab_access.py`: ba trường hợp
+YAML/API, nhiều user, cả hai nhóm, push/No, /reset, master mới, khóa phiên,
+callback cũ và dọn file biến tạm khi lỗi/timeout. Git dùng repo thật trong
+thư mục tạm; API, Ansible và Telegram được mô phỏng.
+
+`tests/test_scoped_ansible.py` có 3 test chạy Ansible thật trên localhost:
+extra-vars ghi đè inventory/vars_files khi cfg yêu cầu merge, ghub dùng
+playbook chung nhưng vẫn nhận dữ liệu ghub, /gitlab chỉ chạy service đã chọn
+và callback đo thời gian. Môi trường kiểm tra: Python 3.8.20,
+ansible-core 2.12.10, Jinja2 2.10.1. Chưa thử trên GitLab nội bộ thật.
+
+```bash
+python -m unittest discover -s tests -p 'test_gitlab_access.py' -v
+python -m unittest discover -s tests -p 'test_scoped_ansible.py' -v
+```
 
 Tại container, kiểm tra cú pháp các module:
 
 ```bash
-python -m py_compile bot.py config.py git_auth.py runtime.py workflow.py gitlab_access.py gitlab_conversation.py
+python -m py_compile bot.py config.py git_auth.py runtime.py workflow.py gitlab_access.py gitlab_conversation.py ansible_callbacks/bot_timing.py
 ```
 
 Kiểm tra tích hợp trên service thử nghiệm: cả ba trường hợp YAML/API, xác minh

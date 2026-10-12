@@ -6,6 +6,8 @@ import os
 import re
 import stat
 import tempfile
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -31,6 +33,8 @@ REPOSITORIES = {
     "non-ghub": ("group_vars/gitlab", "gitlab-repos.yaml"),
 }
 MAX_USERS = 50
+RESET_PLAYBOOK = "gitlab-repos.yaml"
+SCOPED_VARS_FILE = "group_vars/gitlab-bot"
 SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$")
 USERNAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,254}$")
 
@@ -125,6 +129,17 @@ class AppliedChange:
 class AccessResult:
     command: tuple
     recap: str
+    elapsed_seconds: float = 0.0
+    project_count: int = 0
+    total_project_count: int = 0
+
+
+@dataclass(frozen=True)
+class ResetResult:
+    namespace: str
+    repo_kind: str
+    head: str
+    result: AccessResult
 
 
 @dataclass
@@ -277,6 +292,51 @@ def _atomic_write(path, content):
             temporary.unlink()
 
 
+def namespace_variables(source, namespace, access_file=ACCESS_FILE, service=None):
+    """Keep shared variables, but limit groups/projects to the selected namespace."""
+    _, document, nodes = _load(source, access_file)
+    _, projects = _namespace(document, namespace)
+    if not projects:
+        raise WorkflowError("Namespace %s chưa có project để chạy Ansible." % namespace)
+    total = sum(len(entry.get("project", [])) for entry in document["gitlab_projects"].values()
+                if isinstance(entry, dict) and isinstance(entry.get("project"), list))
+    scoped = copy.deepcopy(document)
+    scoped["gitlab_groups"] = [group for group in scoped["gitlab_groups"]
+                               if isinstance(group, dict) and group.get("path") == namespace]
+    scoped["gitlab_projects"] = {namespace: scoped["gitlab_projects"][namespace]}
+    if service is not None:
+        project, _ = _project(scoped, nodes, namespace, service)
+        scoped["gitlab_projects"][namespace]["project"] = [project]
+    return scoped, len(scoped["gitlab_projects"][namespace]["project"]), total
+
+
+@contextmanager
+def scoped_variables_file(repo, variables):
+    """Create this run's private vars file without replacing an existing file."""
+    path = repo / SCOPED_VARS_FILE
+    content = yaml.safe_dump(variables, allow_unicode=True, sort_keys=False).encode("utf-8")
+    try:
+        descriptor = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError as exc:
+        raise WorkflowError("%s đã tồn tại; kiểm tra file còn lại trước khi chạy lại." % SCOPED_VARS_FILE) from exc
+    created = os.fstat(descriptor)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        yield SCOPED_VARS_FILE
+    finally:
+        try:
+            current = path.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            if (current.st_dev, current.st_ino) != (created.st_dev, created.st_ino):
+                raise WorkflowError("File biến tạm đã bị thay thế; giữ lại để kiểm tra.")
+            path.unlink()
+
+
 class GitLabAccessWorkflow:
     def __init__(self, settings, access_client=None):
         self.settings = settings
@@ -296,12 +356,12 @@ class GitLabAccessWorkflow:
             raise WorkflowError("Git thất bại (exit %s).\n%s" % (code, output[-3000:]))
         return output
 
-    def _require_files(self, repo_kind="ghub"):
+    def _require_files(self, repo_kind="ghub", playbook=None):
         root = _git(self.repo, "rev-parse", "--show-toplevel", settings=self.settings)
         if Path(root).resolve() != self.repo:
             raise WorkflowError("GIT_CLONE_DIR phải là thư mục gốc của repo Ansible.")
-        access_file, playbook = repository_files(repo_kind)
-        for name in (access_file, INVENTORY, playbook):
+        access_file, default_playbook = repository_files(repo_kind)
+        for name in (access_file, INVENTORY, playbook or default_playbook):
             path = self.repo / name
             if not path.is_file() or path.is_symlink() or path.resolve() != path:
                 raise WorkflowError("Repo thiếu file thường %s." % name)
@@ -317,17 +377,17 @@ class GitLabAccessWorkflow:
             access_file=access_file,
         )
 
-    def _require_clean(self, repo_kind="ghub"):
-        self._require_files(repo_kind)
+    def _require_clean(self, repo_kind="ghub", playbook=None):
+        self._require_files(repo_kind, playbook)
         report = self.report(repo_kind)
         if report.branch != REQUIRED_BRANCH or report.porcelain:
             raise GitCheckError(
-                "Repo phải ở branch master và sạch trước lượt /gitlab. Xử lý diff hiện tại rồi thử lại.", report,
+                "Repo phải ở branch master và sạch. Xử lý diff hiện tại rồi thử lại.", report,
             )
         return report
 
-    def namespaces(self, repo_kind="ghub"):
-        self._require_files(repo_kind)
+    def namespaces(self, repo_kind="ghub", playbook=None):
+        self._require_files(repo_kind, playbook)
         _, document, _ = _load(self._path(repo_kind).read_bytes(), repository_files(repo_kind)[0])
         groups = document.get("gitlab_groups")
         if not isinstance(groups, list):
@@ -344,6 +404,32 @@ class GitLabAccessWorkflow:
                 if services:
                     result.append(namespace)
         return tuple(result)
+
+    def reset_namespaces(self, repo_kind):
+        return self.namespaces(repo_kind, RESET_PLAYBOOK)
+
+    def reset_namespace(self, repo_kind, namespace):
+        """Apply one namespace from the freshly pulled, clean remote master."""
+        repository_files(repo_kind)
+        if not SLUG.fullmatch(namespace):
+            raise WorkflowError("Tên namespace không hợp lệ.")
+        if self.report(repo_kind).porcelain:
+            raise GitCheckError("Repo còn thay đổi local; hoàn tất lượt /gitlab trước khi /reset.",
+                                self.report(repo_kind))
+        self._return_master(repo_kind, RESET_PLAYBOOK)
+        before = self._require_clean(repo_kind, RESET_PLAYBOOK)
+        remote_head = _git(self.repo, "rev-parse", "origin/" + REQUIRED_BRANCH, settings=self.settings)
+        if before.head != remote_head:
+            raise GitCheckError("Local master có commit ngoài origin/master; kiểm tra trước khi /reset.", before)
+        source = self._path(repo_kind).read_bytes()
+        result = self._run_namespace_playbook(
+            namespace, repo_kind, RESET_PLAYBOOK, source,
+            "YAML master không thay đổi; Ansible có thể đã áp dụng một phần.",
+        )
+        after = self._require_clean(repo_kind, RESET_PLAYBOOK)
+        if after.head != before.head or self._path(repo_kind).read_bytes() != source:
+            raise GitCheckError("Repo đã đổi trong lúc /reset; kiểm tra quyền và YAML trước khi chạy lại.", after)
+        return ResetResult(namespace, repo_kind, before.head, result)
 
     def services(self, namespace, repo_kind="ghub"):
         self._require_files(repo_kind)
@@ -505,28 +591,63 @@ class GitLabAccessWorkflow:
             raise WorkflowError("Ansible đã chạy nhưng chưa xác nhận đủ quyền.\n" + "\n".join(errors))
 
     def _run_access_playbook(self, request, failure_note):
+        return self._run_namespace_playbook(
+            request.namespace, request.repo_kind, request.playbook,
+            self._path(request.repo_kind).read_bytes(), failure_note, service=request.service,
+        )
+
+    def _run_namespace_playbook(self, namespace, repo_kind, playbook, source, failure_note, service=None):
+        variables, project_count, total = namespace_variables(source, namespace, repository_files(repo_kind)[0], service)
         args = (
-            self.settings.ansible_binary, "-i", INVENTORY, request.playbook,
-            "--tags=" + request.namespace + ",project_user_access",
+            self.settings.ansible_binary, "-i", INVENTORY, playbook,
+            "--tags=" + namespace + ",project_user_access",
+            "--extra-vars=@" + SCOPED_VARS_FILE,
         )
         env = os.environ.copy()
         env["ANSIBLE_NOCOLOR"] = "1"
+        # Replacing the mapping is essential: merging would re-add other namespaces.
+        env["ANSIBLE_HASH_BEHAVIOUR"] = "replace"
+        callback_path = str(Path(__file__).resolve().parent / "ansible_callbacks")
+        env["ANSIBLE_CALLBACK_PLUGINS"] = callback_path + (os.pathsep + env["ANSIBLE_CALLBACK_PLUGINS"]
+                                                          if env.get("ANSIBLE_CALLBACK_PLUGINS") else "")
+        callbacks = [name.strip() for name in env.get("ANSIBLE_CALLBACKS_ENABLED", "").split(",") if name.strip()]
+        if "bot_timing" not in callbacks:
+            callbacks.append("bot_timing")
+        env["ANSIBLE_CALLBACKS_ENABLED"] = ",".join(callbacks)
+        started = time.monotonic()
         try:
-            code, output = _command(args, cwd=self.repo,
-                                    timeout=self.settings.ansible_timeout_seconds, env=env)
+            with scoped_variables_file(self.repo, variables):
+                code, output = _command(args, cwd=self.repo,
+                                        timeout=self.settings.ansible_timeout_seconds, env=env)
         except WorkflowError as exc:
             raise WorkflowError("%s\n%s" % (exc, failure_note)) from exc
+        elapsed = time.monotonic() - started
         if code:
             detail = redact_git_output(_recap(output) or output[-3000:], self.settings.gitlab_token)
             raise WorkflowError("Ansible thất bại (exit %s).\n%s\n%s" % (code, detail, failure_note))
-        return AccessResult(args, _recap(output))
+        recap = _recap(output)
+        timing = "⏱ Ansible: %.1f giây; namespace %s: %s/%s project." % (elapsed, namespace, project_count, total)
+        if service is not None:
+            timing += " Service: " + service
+        slow_tasks = []
+        for line in output.splitlines():
+            if line.startswith("INFRA_BOT_TASK_TIMING "):
+                try:
+                    item = json.loads(line[len("INFRA_BOT_TASK_TIMING "):])
+                    seconds = float(item["seconds"])
+                    name = redact_git_output(str(item["task"]), self.settings.gitlab_token)[:200]
+                    slow_tasks.append("%.1fs — %s" % (seconds, name))
+                except (KeyError, TypeError, ValueError):
+                    continue
+        details = "\n🐢 Task tốn thời gian:\n" + "\n".join(slow_tasks[:5]) if slow_tasks else ""
+        return AccessResult(args, (recap + "\n" + timing + details).strip(), elapsed, project_count, total)
 
-    def _return_master(self, repo_kind="ghub"):
+    def _return_master(self, repo_kind="ghub", playbook=None):
         if self.report(repo_kind).porcelain:
             raise WorkflowError("Repo còn thay đổi local; chưa thể trở về master/pull.")
         _git(self.repo, "checkout", REQUIRED_BRANCH, settings=self.settings)
         _git(self.repo, "pull", "--ff-only", "origin", REQUIRED_BRANCH, settings=self.settings, timeout=self.settings.git_clone_timeout_seconds)
-        self._require_clean(repo_kind)
+        self._require_clean(repo_kind, playbook)
  
     def prepare_branch(self, change, state):
         if change.mode != "update":

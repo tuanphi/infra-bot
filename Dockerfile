@@ -31,6 +31,10 @@ RUN python -m pip install --no-cache-dir 'pip<25' \
     && ansible --version | grep -F 'ansible [core 2.12.10]'
 
 COPY config.py git_auth.py runtime.py workflow.py gitlab_access.py gitlab_conversation.py bot.py ./
+COPY ansible_callbacks/bot_timing.py ./ansible_callbacks/bot_timing.py
+
+RUN python -m py_compile config.py git_auth.py runtime.py workflow.py gitlab_access.py gitlab_conversation.py bot.py ansible_callbacks/bot_timing.py
+
 COPY bin/run ./bin/run
 
 RUN chmod +x ./bin/run
