@@ -59,11 +59,11 @@ def already_granted(request):
 
 
 def access_summary(request):
-    lines = ["Nhóm: %s\nNamespace: %s\nService: %s\nProject: %s\nRole được chọn: %s"
+    lines = ["🗂 Nhóm: %s\n📁 Namespace: %s\n🧩 Service: %s\n🔗 Project: %s\n🛡 Role được chọn: %s"
              % (request.repo_kind, request.namespace, request.service, request.project_path, request.role)]
     modes = {"unchanged": "✅ đã có quyền", "sync": "🔄 cần đồng bộ GitLab", "update": "📝 cần sửa YAML"}
     for access, mode in zip(request.accesses, request.user_modes):
-        lines.append("%s: %s\nGitLab API: %s; access_level: %s; User ID: %s; expires_at: %s"
+        lines.append("👤 %s: %s\n🔎 GitLab API: %s\n🔢 access_level: %s\n🆔 User ID: %s\n📅 expires_at: %s"
                      % (access.username, modes[mode], access.role or "chưa có membership",
                         access.access_level if access.access_level is not None else "none",
                         access.user_id, access.expires_at or "none"))
@@ -120,27 +120,49 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
         session["menu_id"] = message.message_id
         return RESET_REPOSITORY
 
-    async def show_reset_namespaces(message, session, page=0):
-        namespaces = session["namespaces"]
-        pages = (len(namespaces) + NAMESPACE_PAGE_SIZE - 1) // NAMESPACE_PAGE_SIZE
+    async def show_selection_menu(message, session, values, title, action, page_action, page=0):
+        pages = (len(values) + NAMESPACE_PAGE_SIZE - 1) // NAMESPACE_PAGE_SIZE
         page = max(0, min(page, pages - 1))
         start_index = page * NAMESPACE_PAGE_SIZE
         buttons = [InlineKeyboardButton(
-            name, callback_data="gitlab:%s:resetns:%s" % (session["nonce"], index),
-        ) for index, name in enumerate(namespaces) if start_index <= index < start_index + NAMESPACE_PAGE_SIZE]
+            name, callback_data="gitlab:%s:%s:%s" % (session["nonce"], action, index),
+        ) for index, name in enumerate(values) if start_index <= index < start_index + NAMESPACE_PAGE_SIZE]
         rows = [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
         navigation = []
         if page:
-            navigation.append(InlineKeyboardButton("⬅️", callback_data="gitlab:%s:resetpage:%s" % (session["nonce"], page - 1)))
+            navigation.append(InlineKeyboardButton("⬅️", callback_data="gitlab:%s:%s:%s" % (session["nonce"], page_action, page - 1)))
         if page + 1 < pages:
-            navigation.append(InlineKeyboardButton("➡️", callback_data="gitlab:%s:resetpage:%s" % (session["nonce"], page + 1)))
+            navigation.append(InlineKeyboardButton("➡️", callback_data="gitlab:%s:%s:%s" % (session["nonce"], page_action, page + 1)))
         if navigation:
             rows.append(navigation)
+        if pages > 1:
+            title += "\n📄 Trang %s/%s" % (page + 1, pages)
         menu = await message.reply_text(
-            "♻️ Nhóm %s — chọn namespace để chạy /reset (trang %s/%s)." % (session["repo_kind"], page + 1, pages),
+            title,
             reply_markup=InlineKeyboardMarkup(rows),
         )
         session["menu_id"] = menu.message_id
+
+    async def show_namespaces(message, session, page=0):
+        await show_selection_menu(
+            message, session, session["namespaces"],
+            "📁 Chọn project\n🗂 Nhóm: " + session["repo_kind"],
+            "namespace", "namespacepage", page,
+        )
+
+    async def show_services(message, session, page=0):
+        await show_selection_menu(
+            message, session, session["services"],
+            "📁 Chọn service\n🗂 Nhóm: %s\n📁 Namespace: %s" % (session["repo_kind"], session["namespace"]),
+            "service", "servicepage", page,
+        )
+
+    async def show_reset_namespaces(message, session, page=0):
+        await show_selection_menu(
+            message, session, session["namespaces"],
+            "♻️ Nhóm %s — chọn namespace để chạy /reset." % session["repo_kind"],
+            "resetns", "resetpage", page,
+        )
 
     async def reset_repository_input(update, ctx):
         session = await callback_session(update, ctx)
@@ -251,37 +273,54 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
             await clear_session(update, ctx)
             return ConversationHandler.END
         session.update(repo_kind=repo_kind, namespaces=namespaces, menu_id=None)
-        await reply_full(update.effective_message, "📁 Đã chọn %s.\nNamespace: %s\nNhập tên namespace"
-                        % (repo_kind, ", ".join(namespaces)))
+        await show_namespaces(update.effective_message, session)
         return NAMESPACE
- 
+
     async def namespace_input(update, ctx):
-        if not await authorized(update):
-            return ConversationHandler.END
-        namespace = update.effective_message.text.strip()
-        session = get_session(update, ctx)
+        session = await callback_session(update, ctx)
+        if session is None:
+            return NAMESPACE
+        action, value = update.callback_query.data.split(":")[-2:]
+        index = int(value)
+        if action == "namespacepage":
+            await update.callback_query.edit_message_reply_markup(reply_markup=None)
+            await show_namespaces(update.effective_message, session, index)
+            return NAMESPACE
+        if not 0 <= index < len(session["namespaces"]):
+            await update.effective_message.reply_text("❌ Lựa chọn project không hợp lệ; bấm nút trong menu hiện tại.")
+            return NAMESPACE
+        namespace = session["namespaces"][index]
+        await update.callback_query.edit_message_reply_markup(reply_markup=None)
         try:
             services = await backend(workflow.services, namespace, session["repo_kind"])
             if not services:
                 raise WorkflowError("Namespace %s chưa có service." % namespace)
-        except WorkflowError as exc:
-            await reply_full(update.effective_message, "❌ %s\nNhập tên namespace" % exc)
-            return NAMESPACE
-        session.update(namespace=namespace, services=services)
-        await reply_full(update.effective_message, "Service: %s\nNhập tên service" % ", ".join(services))
-        return SERVICE
- 
-    async def service_input(update, ctx):
-        if not await authorized(update):
+        except Exception as exc:
+            if not isinstance(exc, WorkflowError):
+                logging.exception("Unexpected /gitlab service lookup failure")
+            await reply_full(update.effective_message, "❌ " + (str(exc) if isinstance(exc, WorkflowError)
+                                                              else "Không đọc được service; kiểm tra log bot."))
+            await clear_session(update, ctx)
             return ConversationHandler.END
-        session = get_session(update, ctx)
-        service = update.effective_message.text.strip()
-        if service not in session["services"]:
-            await reply_full(update.effective_message,
-                            "❌ Service không tồn tại trong namespace %s.\nDanh sách: %s\nNhập tên service"
-                            % (session["namespace"], ", ".join(session["services"])))
+        session.update(namespace=namespace, services=services, menu_id=None)
+        await show_services(update.effective_message, session)
+        return SERVICE
+
+    async def service_input(update, ctx):
+        session = await callback_session(update, ctx)
+        if session is None:
             return SERVICE
-        session["service"] = service
+        action, value = update.callback_query.data.split(":")[-2:]
+        index = int(value)
+        if action == "servicepage":
+            await update.callback_query.edit_message_reply_markup(reply_markup=None)
+            await show_services(update.effective_message, session, index)
+            return SERVICE
+        if not 0 <= index < len(session["services"]):
+            await update.effective_message.reply_text("❌ Lựa chọn service không hợp lệ; bấm nút trong menu hiện tại.")
+            return SERVICE
+        await update.callback_query.edit_message_reply_markup(reply_markup=None)
+        session.update(service=session["services"][index], menu_id=None)
         await update.effective_message.reply_text(
             "👥 Nhập username GitLab, cách nhau bằng dấu phẩy, khoảng trắng hoặc xuống dòng.\nVí dụ: anhtn, tuanpv",
         )
@@ -391,15 +430,16 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
         info = session["push_preview"]
         await reply_full(
             message,
-            "Thông tin branch trước khi push\nBranch: %s\nCommit: %s\nCommit message: %s\n\nDifference:\n%s"
+            "🔎 Thông tin branch trước khi push\n🌿 Branch: %s\n🆔 Commit: %s\n📝 Commit message: %s\n\n📋 Difference:\n%s"
             % (info.branch, info.commit, info.message, info.difference),
         )
         keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton(answer.title(), callback_data="gitlab:%s:push:%s" % (session["nonce"], answer))
+            InlineKeyboardButton("✅ Yes" if answer == "yes" else "❌ No",
+                                 callback_data="gitlab:%s:push:%s" % (session["nonce"], answer))
             for answer in ("yes", "no")
         ]])
         menu = await message.reply_text(
-            "Bạn có muốn đẩy branch lên repo không?\nYes: Push branch / No: Huỷ thay đổi",
+            "🚀 Bạn có muốn đẩy branch lên repo không?\n✅ Yes: Push branch\n❌ No: Huỷ thay đổi",
             reply_markup=keyboard,
         )
         session.update(menu_id=menu.message_id, stage="review")
@@ -578,7 +618,7 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
 
     async def use_buttons(update, ctx):
         if await authorized(update):
-            await update.effective_message.reply_text("Bấm nút ghub/non-ghub, namespace, role hoặc Yes/No ở tin nhắn của bot; dùng /cancel để dừng.")
+            await update.effective_message.reply_text("Bấm nút ghub/non-ghub, project, service, role hoặc Yes/No ở tin nhắn của bot; dùng /cancel để dừng.")
 
     async def stale_callback(update, ctx):
         command = "/reset" if ":reset" in update.callback_query.data else "/gitlab"
@@ -602,8 +642,10 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
                 RESET_NAMESPACE: [CallbackQueryHandler(reset_namespace_input, pattern=r"^gitlab:[0-9a-f]{12}:reset(?:ns|page):[0-9]+$"),
                                   MessageHandler(text, use_buttons)],
                 REPOSITORY: [CallbackQueryHandler(repository_input, pattern=r"^gitlab:[0-9a-f]{12}:repo:(ghub|non-ghub)$"), MessageHandler(text,use_buttons)],              
-                NAMESPACE: [MessageHandler(text, namespace_input)],
-                SERVICE: [MessageHandler(text, service_input)],
+                NAMESPACE: [CallbackQueryHandler(namespace_input, pattern=r"^gitlab:[0-9a-f]{12}:namespace(?:page)?:[0-9]+$"),
+                            MessageHandler(text, use_buttons)],
+                SERVICE: [CallbackQueryHandler(service_input, pattern=r"^gitlab:[0-9a-f]{12}:service(?:page)?:[0-9]+$"),
+                          MessageHandler(text, use_buttons)],
                 USER: [MessageHandler(text, user_input)],
                 ROLE: [CallbackQueryHandler(role_input, pattern=r"^gitlab:[0-9a-f]{12}:role:(maintainer|developer|reporter|guest)$"),
                        MessageHandler(text, use_buttons)],

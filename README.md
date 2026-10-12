@@ -1,7 +1,7 @@
 # Ansible Telegram bot
 
-Bot hỗ trợ `/gitlab` để chọn **ghub/non-ghub**, nhập namespace/service, một hoặc
-nhiều username GitLab và chọn role chung. Bot đối chiếu file YAML của nhóm đã
+Bot hỗ trợ `/gitlab` để chọn **ghub/non-ghub**, chọn namespace/service bằng nút,
+nhập một hoặc nhiều username GitLab và chọn role chung. Bot đối chiếu file YAML của nhóm đã
 chọn với quyền thực tế qua GitLab REST API: đã khớp thì kết
 thúc; YAML đúng nhưng API khác thì hỏi Yes/No để chạy Ansible và xác minh lại
 API, không tạo commit/branch. Khi YAML cần thay đổi, bot hỏi Yes/No trước khi sửa
@@ -48,16 +48,23 @@ và các dependency role/collection tại môi trường của bạn.
 
 ## Luồng /gitlab
 
-1. Gửi `/gitlab` → chọn ghub/non-ghub → namespace → service → username GitLab,
+1. Gửi `/gitlab` → chọn ghub/non-ghub → **📁 Chọn project** (namespace) →
+   **📁 Chọn service** bằng nút → nhập username GitLab,
    rồi chọn một role chung: `maintainer`, `developer`, `reporter`, `guest`.
    Có thể nhập một user hoặc nhiều user cách nhau bằng dấu phẩy, khoảng trắng
    hoặc xuống dòng; tối đa 50 user, tự loại bỏ username trùng.
+   Project/service và namespace của /reset dùng menu tối đa 12 lựa chọn/trang,
+   hai nút mỗi hàng, có ⬅️/➡️ khi cần. Chỉ nhận lựa chọn bằng nút; tin nhắn
+   nhập tay tại bước này được hướng dẫn bấm nút. Callback dùng index và được
+   kiểm tra nonce/message ID để loại bỏ nút cũ hoặc của người khác.
 2. Bot tra user ID qua `GET /users?username=...`, lấy role hiện tại qua
    `GET /projects/<encoded-project-path>/members/all/<user-id>` và so sánh với
    YAML theo bảng dưới cho từng user. Sau khi chọn role, bot báo
    `🔎 Đang kiểm tra quyền GitLab và đối chiếu YAML...` rồi gửi kết quả.
    Khi cần chạy Ansible, bot hỏi Yes/No; tin nhắn gồm role,
    user ID, project, `access_level`, `expires_at` và thông báo hành động.
+   Metadata có icon 🗂/📁/🧩/🔗/🛡; mỗi user có 👤 và từng trường API có
+   🔎/🔢/🆔/📅, chia dòng để đọc rõ.
    No hoặc `/cancel` tại bước này kết thúc trước khi sửa file hoặc chạy Ansible.
    Nếu kiểm tra gặp lỗi nội bộ, bot báo ❌, ghi traceback trong log với nhãn
    `Unexpected /gitlab preview failure`, xoá phiên và cho phép chạy `/gitlab`
@@ -93,6 +100,9 @@ và các dependency role/collection tại môi trường của bạn.
 7. Bot gửi **Thông tin branch trước khi push** gồm branch, commit SHA,
    commit message và toàn bộ difference từ commit trước thay đổi tới commit
    đã chuẩn bị. Sau đó hỏi Yes/No để xác nhận push branch.
+   Menu có nội dung `🚀 Bạn có muốn đẩy branch lên repo không?`,
+   `✅ Yes: Push branch`, `❌ No: Huỷ thay đổi` và hai nút **✅ Yes**, **❌ No**.
+   Callback vẫn là `:push:yes` / `:push:no`.
 8. Yes xác nhận push: kiểm tra lại thông tin đúng bản đã xem, push branch
    lên `origin`. Luồng `/gitlab` kết thúc sau push và checkout/pull; không gọi API tạo MR.
 9. No sau Ansible hoặc No tại menu xác nhận push: phục hồi chính xác YAML
@@ -197,17 +207,14 @@ YAML chính vẫn được cập nhật bởi luồng `/gitlab` hiện có: thay
 giữ các namespace khác và giữ diff để xác nhận push. File non-ghub chính là
 `group_vars/gitlab`; ghub là `group_vars/gitlab-ghub`.
 
-Kết quả có tổng thời gian Ansible, số project đã truyền và tối đa 5 task tốn
-thời gian nhất. Callback `ansible_callbacks/bot_timing.py` đo thời gian giữa
-các sự kiện bắt đầu task; thông tin này giúp xác định task/API còn chậm.
+Kết quả có tổng thời gian chạy Ansible và số project đã truyền.
 Ví dụ định dạng: `⏱ Ansible: <giây>; namespace devops: 9/258 project.`
 Chưa đo playbook/GitLab nội bộ nên không cam kết thời gian dưới 5 phút.
 
 `--tags=a,b` chọn task khớp một trong hai tag, không tự giới hạn namespace
 trong dữ liệu vòng lặp. Tăng `forks` chủ yếu tăng số host song song; với một
-localhost, cần giảm dữ liệu vòng lặp và xem task timing trước.
-Xem [Ansible variable precedence](https://docs.ansible.com/projects/ansible/latest/playbook_guide/playbooks_variables.html#variable-precedence-where-should-i-put-a-variable)
-và [callback plugins](https://docs.ansible.com/projects/ansible/latest/plugins/callback.html).
+localhost, cần giảm dữ liệu vòng lặp để giới hạn số project phải xử lý.
+Xem [Ansible variable precedence](https://docs.ansible.com/projects/ansible/latest/playbook_guide/playbooks_variables.html#variable-precedence-where-should-i-put-a-variable).
 
 ## Luồng /run
 
@@ -346,19 +353,21 @@ không phải project service được cấp quyền. API kiểm tra role dùng 
 `GIT_TARGET_BRANCH=master`; branch này phải tồn tại trên GitLab.
 Lệnh chạy không chấp nhận tham số Ansible tùy ý từ Telegram. Để debug, thực
 hiện thủ công trên cùng commit và cùng môi trường. Bot trả `PLAY RECAP`,
-thời gian Ansible và tên/thời gian task; không gửi toàn bộ stdout Ansible.
+thời gian chạy Ansible và số project; không gửi toàn bộ stdout Ansible.
 
 ## Kiểm tra
 
-Bộ kiểm tra gồm 39 test trong `tests/test_gitlab_access.py`: ba trường hợp
+Bộ kiểm tra gồm 45 test trong `tests/test_gitlab_access.py`: ba trường hợp
 YAML/API, nhiều user, cả hai nhóm, push/No, /reset, master mới, khóa phiên,
 callback cũ và dọn file biến tạm khi lỗi/timeout. Git dùng repo thật trong
 thư mục tạm; API, Ansible và Telegram được mô phỏng.
+Các test menu kiểm tra project/service ở cả hai nhóm, phân trang, tên dài,
+callback cũ/index sai, nhập tay, lỗi đọc service và icon xác nhận push.
 
 `tests/test_scoped_ansible.py` có 3 test chạy Ansible thật trên localhost:
 extra-vars ghi đè inventory/vars_files khi cfg yêu cầu merge, ghub dùng
-playbook chung nhưng vẫn nhận dữ liệu ghub, /gitlab chỉ chạy service đã chọn
-và callback đo thời gian. Môi trường kiểm tra: Python 3.8.20,
+playbook chung nhưng vẫn nhận dữ liệu ghub và /gitlab chỉ chạy service đã chọn.
+Môi trường kiểm tra: Python 3.8.20,
 ansible-core 2.12.10, Jinja2 2.10.1. Chưa thử trên GitLab nội bộ thật.
 
 ```bash
@@ -369,7 +378,7 @@ python -m unittest discover -s tests -p 'test_scoped_ansible.py' -v
 Tại container, kiểm tra cú pháp các module:
 
 ```bash
-python -m py_compile bot.py config.py git_auth.py runtime.py workflow.py gitlab_access.py gitlab_conversation.py ansible_callbacks/bot_timing.py
+python -m py_compile bot.py config.py git_auth.py runtime.py workflow.py gitlab_access.py gitlab_conversation.py
 ```
 
 Kiểm tra tích hợp trên service thử nghiệm: cả ba trường hợp YAML/API, xác minh

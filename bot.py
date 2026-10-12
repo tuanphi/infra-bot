@@ -127,7 +127,7 @@ def build_application(settings):
     async def help_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if await authorized(update):
             await update.effective_message.reply_text(
-                "Dùng /gitlab để chọn ghub/non-ghub, namespace/service, danh sách user và role chung. "
+                "Dùng /gitlab để chọn ghub/non-ghub, project/service bằng nút, nhập danh sách user và chọn role chung. "
                 "Dùng /reset để chọn nhóm/namespace, lấy master và chạy lại quyền theo YAML.\n"
                 "Dùng /cancel để dừng trước khi xác nhận.\n"
                 "Dùng /whoami để xem chat_id, user_id và quyền truy cập.\n"
