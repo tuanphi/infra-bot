@@ -11,11 +11,12 @@ from telegram.error import TelegramError
 from telegram.ext import CallbackQueryHandler, CommandHandler, ConversationHandler, MessageHandler, filters
 from telegram.warnings import PTBUserWarning
 
-from gitlab_access import BranchPushInfo, Finalization, GitCheckError, ROLES, USERNAME
+from gitlab_access import ACCESS_FILE, BranchPushInfo, Finalization, GitCheckError, ROLES, parse_usernames
 from workflow import WorkflowError
 
 
 NAMESPACE, SERVICE, USER, ROLE, CONFIRM = range(5)
+REPOSITORY = 5
 SESSION_KEY = "gitlab_access"
 
 
@@ -45,7 +46,26 @@ async def reply_full(message, text):
 
 async def reply_git_report(message, report):
     await reply_full(message, "$ git status\n" + report.status)
-    await reply_full(message, "$ git diff group_vars/gitlab-ghub\n" + (report.diff or "(không có diff)"))
+    await reply_full(message, "$ git diff %s\n%s" % (getattr(report, "access_file", ACCESS_FILE),
+                                                   report.diff or "(không có diff)"))
+
+
+def already_granted(request):
+    return "✅ %s đã có role %s tại %s/%s. YAML và GitLab đã khớp." % (
+        ", ".join(request.usernames), request.role, request.namespace, request.service,
+    )
+
+
+def access_summary(request):
+    lines = ["Nhóm: %s\nNamespace: %s\nService: %s\nProject: %s\nRole được chọn: %s"
+             % (request.repo_kind, request.namespace, request.service, request.project_path, request.role)]
+    modes = {"unchanged": "✅ đã có quyền", "sync": "🔄 cần đồng bộ GitLab", "update": "📝 cần sửa YAML"}
+    for access, mode in zip(request.accesses, request.user_modes):
+        lines.append("%s: %s\nGitLab API: %s; access_level: %s; User ID: %s; expires_at: %s"
+                     % (access.username, modes[mode], access.role or "chưa có membership",
+                        access.access_level if access.access_level is not None else "none",
+                        access.user_id, access.expires_at or "none"))
+    return "\n\n".join(lines)
 
 
 def create_gitlab_conversation(workflow, run_lock, authorized):
@@ -86,27 +106,53 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
             await update.effective_message.reply_text("Repo đang được xử lý hoặc chờ Yes/No; thử lại sau.")
             return ConversationHandler.END
         await clear_session(update, ctx)
-        ctx.user_data.setdefault(SESSION_KEY, {})[update.effective_chat.id] = {
+        session = {
             "nonce": secrets.token_hex(6), "chat_id": update.effective_chat.id,
-        }
-        await update.effective_message.reply_text("Nhập tên namespace")
-        return NAMESPACE
+         }
+        ctx.user_data.setdefault(SESSION_KEY, {})[update.effective_chat.id] = session
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(kind, callback_data="gitlab:%s:repo:%s" % (session["nonce"], kind))
+            for kind in ("ghub", "non-ghub")
+        ]])
+        message = await update.effective_message.reply_text("📁 Chọn nhóm repo", reply_markup=keyboard)
+        session["menu_id"] = message.message_id
+        return REPOSITORY
 
+    async def repository_input(update, ctx):
+        session = await callback_session(update, ctx)
+        if session is None:
+            return REPOSITORY
+        repo_kind = update.callback_query.data.rsplit(":", 1)[1]
+        await update.callback_query.edit_message_reply_markup(reply_markup=None)
+        try:
+            namespaces = await backend(workflow.namespaces, repo_kind)
+            if not namespaces:
+                raise WorkflowError("Nhóm %s chưa có namespace chứa service." % repo_kind)
+        except WorkflowError as exc:
+            await reply_full(update.effective_message, "❌ " + str(exc))
+            await clear_session(update, ctx)
+            return ConversationHandler.END
+        session.update(repo_kind=repo_kind, namespaces=namespaces, menu_id=None)
+        await reply_full(update.effective_message, "📁 Đã chọn %s.\nNamespace: %s\nNhập tên namespace"
+                        % (repo_kind, ", ".join(namespaces)))
+        return NAMESPACE
+ 
     async def namespace_input(update, ctx):
         if not await authorized(update):
             return ConversationHandler.END
         namespace = update.effective_message.text.strip()
+        session = get_session(update, ctx)
         try:
-            services = await backend(workflow.services, namespace)
+            services = await backend(workflow.services, namespace, session["repo_kind"])
             if not services:
                 raise WorkflowError("Namespace %s chưa có service." % namespace)
         except WorkflowError as exc:
             await reply_full(update.effective_message, "❌ %s\nNhập tên namespace" % exc)
             return NAMESPACE
-        get_session(update, ctx).update(namespace=namespace, services=services)
-        await update.effective_message.reply_text("Nhập tên service")
+        session.update(namespace=namespace, services=services)
+        await reply_full(update.effective_message, "Service: %s\nNhập tên service" % ", ".join(services))
         return SERVICE
-
+ 
     async def service_input(update, ctx):
         if not await authorized(update):
             return ConversationHandler.END
@@ -114,27 +160,31 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
         service = update.effective_message.text.strip()
         if service not in session["services"]:
             await reply_full(update.effective_message,
-                             "❌ Service không tồn tại trong namespace %s.\nDanh sách: %s\nNhập tên service"
-                             % (session["namespace"], ", ".join(session["services"])))
+                            "❌ Service không tồn tại trong namespace %s.\nDanh sách: %s\nNhập tên service"
+                            % (session["namespace"], ", ".join(session["services"])))
             return SERVICE
         session["service"] = service
-        await update.effective_message.reply_text("Nhập tên user")
+        await update.effective_message.reply_text(
+            "👥 Nhập username GitLab, cách nhau bằng dấu phẩy, khoảng trắng hoặc xuống dòng.\nVí dụ: anhtn, tuanpv",
+        )
         return USER
 
     async def user_input(update, ctx):
         if not await authorized(update):
             return ConversationHandler.END
-        username = update.effective_message.text.strip()
-        if not USERNAME.fullmatch(username):
-            await update.effective_message.reply_text("Tên user không hợp lệ. Nhập username GitLab, ví dụ tuanpv.")
+        try:
+            usernames = parse_usernames(update.effective_message.text)
+        except WorkflowError as exc:
+            await reply_full(update.effective_message, "❌ " + str(exc))
             return USER
         session = get_session(update, ctx)
-        session["username"] = username
+        session["usernames"] = usernames
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton(role, callback_data="gitlab:%s:role:%s" % (session["nonce"], role))]
             for role in ROLES
         ])
-        message = await update.effective_message.reply_text("Chọn role", reply_markup=keyboard)
+        await reply_full(update.effective_message, "👥 User: " + ", ".join(usernames))
+        message = await update.effective_message.reply_text("Chọn role chung cho danh sách user", reply_markup=keyboard)
         session["menu_id"] = message.message_id
         return ROLE
 
@@ -160,7 +210,7 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
         await update.callback_query.edit_message_text("Đã chọn role: " + role)
         try:
             request = await backend(workflow.preview, session["namespace"], session["service"],
-                                    session["username"], role)
+                                    session["username"], role, session["repo_kind"])
         except WorkflowError as exc:
             if isinstance(exc, GitCheckError):
                 await reply_git_report(update.effective_message, exc.report)
@@ -176,16 +226,15 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
             )
             await clear_session(update, ctx)
             return ConversationHandler.END
-        status = ("user %s đang có role %s (GitLab API)"
-                  % (request.username, ", ".join(request.current_roles))
-                  if request.current_roles else
-                  "user %s chưa có membership trong project (GitLab API)" % request.username)
-        if request.access is not None:
-            status += "\nUser ID: %s\nProject: %s\naccess_level: %s\nexpires_at: %s" % (
-                request.access.user_id, request.project_path,
-                request.access.access_level if request.access.access_level is not None else "none",
-                request.access.expires_at or "none",
-            )
+        session["request"] = request
+        if request.mode == "unchanged":
+            await reply_full(
+                update.effective_message,
+                already_granted(request),
+             )
+            await clear_session(update, ctx)
+            return ConversationHandler.END
+        await reply_full(update.effective_message, access_summary(request))
         notice = ("🔄 YAML đã đúng; sẽ đồng bộ quyền trên GitLab." if request.mode == "sync" else
                   "📝 Sẽ cập nhật YAML và chạy Ansible.")
         keyboard = InlineKeyboardMarkup([[
@@ -193,8 +242,7 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
             InlineKeyboardButton("No", callback_data="gitlab:%s:confirm:no" % session["nonce"]),
         ]])
         message = await update.effective_message.reply_text(
-            "%s\nNamespace: %s\nService: %s\nRole được chọn: %s\n\n%s\nBạn có muốn tiếp tục?"
-            % (status, request.namespace, request.service, request.role, notice), reply_markup=keyboard,
+           "%s\nBạn có muốn tiếp tục?" % notice, reply_markup=keyboard,
         )
         session["menu_id"] = message.message_id
         return CONFIRM
@@ -255,16 +303,15 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
                 if change.mode == "unchanged":
                     await reply_full(
                         message,
-                        "✅ %s đã có role %s tại %s/%s. YAML và GitLab đã khớp."
-                        % (request.username, request.role, request.namespace, request.service),
+                        already_granted(request),
                     )
                     return
                 await reply_git_report(message, change.report)
                 await message.reply_text(
-                    "%s\nansible-playbook -i nonprod gitlab-repos-ghub.yaml --tags=%s,project_user_access"
+                    "%s\nansible-playbook -i nonprod %s --tags=%s,project_user_access"
                     % ("🔄 YAML đã đúng; đang chạy Ansible để đồng bộ GitLab."
                        if change.mode == "sync" else "📝 Đã cập nhật YAML; đang chạy Ansible.",
-                       request.namespace),
+                       request.playbook, request.namespace),
                 )
                 playbook_started = True
                 result = await backend(workflow.run_playbook, change)
@@ -272,7 +319,7 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
                     await reply_full(
                         message,
                         "✅ Đã đồng bộ quyền.\n%s/%s: %s → %s (GitLab API xác nhận).\n%s"
-                        % (request.namespace, request.service, request.username, request.role, result.recap),
+                        % (request.namespace, request.service, ", ".join(request.usernames), request.role, result.recap),
                     )
                     return
             except GitCheckError as exc:
@@ -291,8 +338,7 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
             session.update(stage="decision", change=change, recap=result.recap)
             awaiting_decision = True
             try:
-                await reply_full(message, "✅ Ansible thành công.\n%s/%s: user %s → %s\n%s"
-                                 % (request.namespace, request.service, request.username, request.role, result.recap))
+                await reply_full(message, "✅ Ansible thành công.\n%s/%s: user %s → %s\n%s" % (request.namespace, request.service, ", ".join(request.usernames), request.role, result.recap))
                 await show_final_menu(message, session)
             except TelegramError:
                 logging.exception("Cannot show final menu; /gitlab can show it again")
@@ -412,7 +458,7 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
 
     async def use_buttons(update, ctx):
         if await authorized(update):
-            await update.effective_message.reply_text("Bấm nút role hoặc Yes/No ở tin nhắn của bot; dùng /cancel để dừng.")
+            await update.effective_message.reply_text("Bấm nút ghub/non-ghub, role hoặc Yes/No ở tin nhắn của bot; dùng /cancel để dừng.")
 
     async def stale_callback(update, ctx):
         await update.callback_query.answer("Lựa chọn đã hết hạn hoặc thuộc người khác. Chạy /gitlab để bắt đầu.", show_alert=True)
@@ -430,6 +476,7 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
         conversation = ConversationHandler(
             entry_points=[CommandHandler("gitlab", start)],
             states={
+                REPOSITORY: [CallbackQueryHandler(repository_input, pattern=r"^gitlab:[0-9a-f]{12}:repo:(ghub|non-ghub)$"), MessageHandler(text,use_buttons)],              
                 NAMESPACE: [MessageHandler(text, namespace_input)],
                 SERVICE: [MessageHandler(text, service_input)],
                 USER: [MessageHandler(text, user_input)],

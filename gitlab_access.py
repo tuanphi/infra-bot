@@ -1,4 +1,4 @@
-"""Edit one GitLab service's users_access and run the requested Ghub playbook."""
+"""Grant one role to multiple users in a ghub/non-ghub GitLab service."""
 
 import copy
 import json
@@ -6,7 +6,7 @@ import os
 import re
 import stat
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -26,9 +26,36 @@ INVENTORY = "nonprod"
 REQUIRED_BRANCH = "master"
 ROLES = ("maintainer", "developer", "reporter", "guest")
 ROLE_LEVELS = {"maintainer": 40, "developer": 30, "reporter": 20, "guest": 10}
+REPOSITORIES = {
+    "ghub": (ACCESS_FILE, PLAYBOOK),
+    "non-ghub": ("group_vars/gitlab", "gitlab-repos.yaml"),
+}
+MAX_USERS = 50
 SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$")
 USERNAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,254}$")
 
+
+def repository_files(repo_kind):
+    if repo_kind not in REPOSITORIES:
+        raise WorkflowError("Nhóm repo không hợp lệ; chọn ghub hoặc non-ghub.")
+    return REPOSITORIES[repo_kind]
+
+def parse_usernames(value):
+    """Accept commas/whitespace and retain each username once, in input order."""
+    values = [user for user in re.split(r"[,\s]", value.strip()) if user] if isinstance(value, str) else value
+    if not isinstance(values, (tuple, list)) or not values:
+        raise WorkflowError("Nhập ít nhất một username GitLab.")
+    users, seen = [], set()
+    for username in values:
+        if not isinstance(username, str) or not USERNAME.fullmatch(username):
+            raise WorkflowError("Tên user không hợp lệ; ví dụ: anhtn, tuanpv.")
+        key = username.casefold()
+        if key not in seen:
+            users.append(username)
+            seen.add(key)
+    if len(users) > MAX_USERS:
+        raise WorkflowError("Mỗi lượt tối đa %s user." % MAX_USERS)
+    return tuple(users)
 
 class UniqueKeyLoader(yaml.SafeLoader):
     def construct_mapping(self, node, deep=False):
@@ -54,6 +81,20 @@ class AccessRequest:
     project_path: str = ""
     access: Optional[ProjectUserAccess] = None
     mode: str = "update"
+    repo_kind: str = "ghub"
+    accesses: tuple = ()
+    user_modes: tuple = ()
+    @property
+    def usernames(self):
+        return tuple(access.username for access in self.accesses) or (self.username,)
+
+    @property
+    def access_file(self):
+        return repository_files(self.repo_kind)[0]
+
+    @property
+    def playbook(self):
+        return repository_files(self.repo_kind)[1]
 
 
 @dataclass(frozen=True)
@@ -63,6 +104,7 @@ class GitReport:
     porcelain: str
     branch: str
     head: str
+    access_file: str = ACCESS_FILE
 
 
 class GitCheckError(WorkflowError):
@@ -112,7 +154,7 @@ def _node_value(node, key):
     raise WorkflowError("YAML thiếu key %s." % key)
 
 
-def _load(source):
+def _load(source, access_file=ACCESS_FILE):
     try:
         text = source.decode("utf-8")
         # An alias could make a change to one list affect several services.
@@ -121,9 +163,9 @@ def _load(source):
         document = yaml.load(text, Loader=UniqueKeyLoader)
         nodes = yaml.compose(text, Loader=UniqueKeyLoader)
     except (UnicodeError, yaml.YAMLError) as exc:
-        raise WorkflowError("Không đọc được YAML trong %s." % ACCESS_FILE) from exc
+        raise WorkflowError("Không đọc được YAML trong %s." % access_file) from exc
     if not isinstance(document, dict):
-        raise WorkflowError("File %s phải chứa một YAML mapping." % ACCESS_FILE)
+        raise WorkflowError("File %s phải chứa một YAML mapping." % access_file)
     return text, document, nodes
 
 
@@ -140,12 +182,12 @@ def _namespace(document, namespace):
     group = matches[0]
     parent = group.get("parent")
     entry = projects[namespace]
-    if not isinstance(parent, str) or not parent or not isinstance(entry, dict):
+    if (parent is not None and (not isinstance(parent, str) or not parent) or not isinstance(entry, dict)):
         raise WorkflowError("Cấu hình namespace %s không hợp lệ." % namespace)
     services = entry.get("project")
     if not isinstance(services, list):
         raise WorkflowError("Namespace %s thiếu danh sách project." % namespace)
-    return parent.rstrip("/") + "/" + namespace, services
+    return (parent.rstrip("/") + "/" if parent else "") + namespace, services
 
 
 def _project(document, nodes, namespace, service):
@@ -192,19 +234,20 @@ def _access(project, project_node):
 
 
 def _updated_content(request):
-    text, document, nodes = _load(request.source)
+    text, document, nodes = _load(request.source, request.access_file)
     project, project_node = _project(document, nodes, request.namespace, request.service)
     access = _access(project, project_node)
     expected = copy.deepcopy(document)
     expected_project, _ = _project(expected, nodes, request.namespace, request.service)
     expected_access = {entry["level"]: entry for entry in expected_project["users_access"]}
     replacements = []
+    selected = set(request.usernames)
     for role, (entry, node) in access.items():
         users = entry["users"]
         if role == request.role:
-            updated = list(users) if request.username in users else users + [request.username]
+            updated = users + [user for user in request.usernames if user not in users]
         else:
-            updated = [user for user in users if user != request.username]
+            updated = [user for user in users if user not in selected]
         expected_access[role]["users"] = updated
         if updated != users:
             replacements.append((node.start_mark.index, node.end_mark.index,
@@ -213,7 +256,7 @@ def _updated_content(request):
     for start, end, replacement in sorted(replacements, reverse=True):
         text = text[:start] + replacement + text[end:]
     content = text.encode("utf-8")
-    if _load(content)[1] != expected:
+    if _load(content, request.access_file)[1] != expected:
         raise WorkflowError("Bản sửa YAML có thay đổi ngoài user/role đã chọn; dừng luồng.")
     return content
 
@@ -241,6 +284,9 @@ class GitLabAccessWorkflow:
         self.path = self.repo / ACCESS_FILE
         self.access_client = access_client or GitLabClient(settings)
 
+    def _path(self, repo_kind):
+        return self.repo / repository_files(repo_kind)[0]
+
     def _git_output(self, *args):
         code, output = git_command(self.settings, [
             "-C", str(self.repo), "-c", "color.ui=false", "--no-pager", *args,
@@ -250,86 +296,127 @@ class GitLabAccessWorkflow:
             raise WorkflowError("Git thất bại (exit %s).\n%s" % (code, output[-3000:]))
         return output
 
-    def _require_files(self):
+    def _require_files(self, repo_kind="ghub"):
         root = _git(self.repo, "rev-parse", "--show-toplevel", settings=self.settings)
         if Path(root).resolve() != self.repo:
             raise WorkflowError("GIT_CLONE_DIR phải là thư mục gốc của repo Ansible.")
-        for name in (ACCESS_FILE, INVENTORY, PLAYBOOK):
+        access_file, playbook = repository_files(repo_kind)
+        for name in (access_file, INVENTORY, playbook):
             path = self.repo / name
             if not path.is_file() or path.is_symlink() or path.resolve() != path:
                 raise WorkflowError("Repo thiếu file thường %s." % name)
 
-    def report(self):
+    def report(self, repo_kind="ghub"):
+        access_file = repository_files(repo_kind)[0]
         return GitReport(
             status=self._git_output("status", "--untracked-files=all"),
-            diff=self._git_output("diff", "--no-ext-diff", "--no-textconv", "--", ACCESS_FILE),
+            diff=self._git_output("diff", "--no-ext-diff", "--no-textconv", "--", access_file),
             porcelain=self._git_output("status", "--porcelain=v1", "-z", "--untracked-files=all"),
             branch=_git(self.repo, "rev-parse", "--abbrev-ref", "HEAD", settings=self.settings),
             head=_git(self.repo, "rev-parse", "HEAD", settings=self.settings),
+            access_file=access_file,
         )
 
-    def _require_clean(self):
-        self._require_files()
-        report = self.report()
+    def _require_clean(self, repo_kind="ghub"):
+        self._require_files(repo_kind)
+        report = self.report(repo_kind)
         if report.branch != REQUIRED_BRANCH or report.porcelain:
             raise GitCheckError(
                 "Repo phải ở branch master và sạch trước lượt /gitlab. Xử lý diff hiện tại rồi thử lại.", report,
             )
         return report
 
-    def namespaces(self):
-        self._require_files()
-        _, document, _ = _load(self.path.read_bytes())
+    def namespaces(self, repo_kind="ghub"):
+        self._require_files(repo_kind)
+        _, document, _ = _load(self._path(repo_kind).read_bytes(), repository_files(repo_kind)[0])
         groups = document.get("gitlab_groups")
         if not isinstance(groups, list):
             raise WorkflowError("YAML thiếu danh sách gitlab_groups.")
-        return tuple(group["path"] for group in groups
-                     if isinstance(group, dict) and isinstance(group.get("path"), str))
+        projects = document.get("gitlab_projects")
+        if not isinstance(projects, dict):
+            raise WorkflowError("YAML thiếu gitlab_projects.")
+        result = []
+        for group in groups:
+            if (isinstance(group, dict) and isinstance(group.get("path"), str)
+                    and group["path"] in projects):
+                namespace = group["path"]
+                _, services = _namespace(document, namespace)
+                if services:
+                    result.append(namespace)
+        return tuple(result)
 
-    def services(self, namespace):
-        self._require_files()
-        _, document, _ = _load(self.path.read_bytes())
+    def services(self, namespace, repo_kind="ghub"):
+        self._require_files(repo_kind)
+        _, document, _ = _load(self._path(repo_kind).read_bytes(), repository_files(repo_kind)[0])
         group_path, projects = _namespace(document, namespace)
         return tuple(project["path"].rsplit("/", 1)[1] for project in projects
                      if isinstance(project, dict) and isinstance(project.get("path"), str)
                      and project["path"].rsplit("/", 1)[0] == group_path)
 
-    def preview(self, namespace, service, username, role):
-        if not USERNAME.fullmatch(username):
-            raise WorkflowError("Tên user không hợp lệ; nhập username GitLab, ví dụ tuanpv.")
+    def preview(self, namespace, service, username, role, repo_kind="ghub"):
+        usernames = parse_usernames(username)
         if role not in ROLES:
             raise WorkflowError("Role không hợp lệ.")
-        report = self._require_clean()
-        source = self.path.read_bytes()
-        _, document, nodes = _load(source)
+        report = self._require_clean(repo_kind)
+        source = self._path(repo_kind).read_bytes()
+        _, document, nodes = _load(source, repository_files(repo_kind)[0])
         project, project_node = _project(document, nodes, namespace, service)
-        _access(project, project_node)
-        access = self.access_client.project_user_access(project["path"], username)
+        yaml_access = _access(project, project_node)
+        accesses = self._read_accesses(project["path"], usernames)
+        access = accesses[0]
         roles = (access.role,) if access.role else ()
         request = AccessRequest(
             namespace, service, access.username, role, roles, report.head, source,
             project_path=project["path"], access=access,
+            repo_kind=repo_kind, accesses=accesses,
         )
         content = _updated_content(request)
-        mode = self._access_mode(request, content, access)
-        return AccessRequest(
-            namespace, service, access.username, role, roles, report.head, source,
-            project_path=project["path"], access=access, mode=mode,
-        )
+        user_modes = []
+        for member in accesses:
+            yaml_correct = (member.username in yaml_access[role][0]["users"]
+                            and all(member.username not in entry["users"]
+                                    for other, (entry, _) in yaml_access.items() if other != role))
+            user_modes.append("update" if not yaml_correct else
+                              "unchanged" if member.access_level == ROLE_LEVELS[role] else "sync")
+        current = self._require_clean(repo_kind)
+        if current.head != report.head or self._path(repo_kind).read_bytes() != source:
+            raise GitCheckError("Cấu hình đã đổi trong lúc kiểm tra user; chạy /gitlab lại.", current)
+        return replace(request, mode=self._access_mode(request, content, accesses),
+                       user_modes=tuple(user_modes))
+
+    def _read_accesses(self, project_path, usernames):
+        accesses = []
+        for username in usernames:
+            try:
+                accesses.append(self.access_client.project_user_access(project_path, username))
+            except WorkflowError as exc:
+                raise WorkflowError("Không kiểm tra được user %s.\n%s" % (username, exc)) from exc
+        if len({access.user_id for access in accesses}) != len(accesses):
+            raise WorkflowError("Danh sách user GitLab có ID trùng; nhập lại username.")
+        return tuple(accesses)
 
     @staticmethod
-    def _access_mode(request, content, access):
+    def _check_user_ids(request, accesses):
+        expected = request.accesses or ((request.access,) if request.access is not None else ())
+        if expected and tuple(access.user_id for access in accesses) != tuple(access.user_id for access in expected):
+            raise WorkflowError("User GitLab đã đổi sau xác nhận; chạy /gitlab lại.")
+
+    @staticmethod
+    def _access_mode(request, content, accesses):
         if content != request.source:
             return "update"
-        return "unchanged" if access.access_level == ROLE_LEVELS[request.role] else "sync"
+        if isinstance(accesses, ProjectUserAccess):
+            accesses = (accesses,)
+        return "unchanged" if all(access.access_level == ROLE_LEVELS[request.role] for access in accesses) else "sync"
 
     def rollback(self, change):
         # Do not overwrite someone else's subsequent edit, or reset other files.
         if change.mode != "update":
             return False
+        path = self._path(change.request.repo_kind)
         try:
-            if not self.path.is_symlink() and self.path.read_bytes() == change.content:
-                _atomic_write(self.path, change.request.source)
+            if not path.is_symlink() and path.read_bytes() == change.content:
+                _atomic_write(path, change.request.source)
                 return True
         except FileNotFoundError:
             # A file removed by someone else must stay removed.
@@ -337,38 +424,39 @@ class GitLabAccessWorkflow:
         return False
 
     def _validate_change(self, change, report):
+        path = self._path(change.request.repo_kind)
         if report.branch != REQUIRED_BRANCH or report.head != change.request.head:
             raise GitCheckError("Branch/commit đã đổi; dừng trước khi chạy Ansible.", report)
         if change.mode in ("sync", "unchanged"):
-            if (report.porcelain or report.diff.strip() or self.path.is_symlink()
-                    or self.path.read_bytes() != change.request.source
+            if (report.porcelain or report.diff.strip() or path.is_symlink()
+                    or path.read_bytes() != change.request.source
                     or change.content != change.request.source):
                 raise GitCheckError("Repo/YAML đã đổi; dừng trước khi đồng bộ quyền GitLab.", report)
             return
         if change.mode != "update":
             raise WorkflowError("Trường hợp cập nhật quyền không hợp lệ.")
-        if report.porcelain != " M " + ACCESS_FILE + "\x00":
-            raise GitCheckError("Git status có thay đổi ngoài file dự kiến hoặc có thay đổi staged; dừng luồng.", report)
-        if not report.diff.strip() or self.path.is_symlink() or self.path.read_bytes() != change.content:
-            raise GitCheckError("Git diff không khớp đúng user/role đã xác nhận; dừng luồng.", report)
+        if report.porcelain != " M " + change.request.access_file + "\x00":
+             raise GitCheckError("Git status có thay đổi ngoài file dự kiến hoặc có thay đổi staged; dừng luồng.", report)
+        if not report.diff.strip() or path.is_symlink() or path.read_bytes() != change.content:
+             raise GitCheckError("Git diff không khớp đúng user/role đã xác nhận; dừng luồng.", report)
 
     def prepare(self, request):
-        report = self._require_clean()
-        if report.head != request.head or self.path.read_bytes() != request.source:
+        report = self._require_clean(request.repo_kind)
+        path = self._path(request.repo_kind)
+        if report.head != request.head or path.read_bytes() != request.source:
             raise GitCheckError("Cấu hình đã đổi sau khi chọn role; chạy /gitlab lại để xác nhận thông tin mới.", report)
         content = _updated_content(request)
         if content == request.source:
             # Re-read membership after Yes; the live role may have changed since preview.
-            access = self.access_client.project_user_access(request.project_path, request.username)
-            if request.access is not None and access.user_id != request.access.user_id:
-                raise WorkflowError("User GitLab đã đổi sau xác nhận; chạy /gitlab lại.")
-            change = AppliedChange(request, content, report, self._access_mode(request, content, access))
-            self._validate_change(change, self.report())
+            accesses = self._read_accesses(request.project_path, request.usernames)
+            self._check_user_ids(request, accesses)
+            change = AppliedChange(request, content, report, self._access_mode(request, content, accesses))
+            self._validate_change(change, self.report(request.repo_kind))
             return change
         change = AppliedChange(request, content, report)
-        _atomic_write(self.path, content)
+        _atomic_write(path, content)
         try:
-            report = self.report()
+            report = self.report(request.repo_kind)
             self._validate_change(change, report)
         except Exception:
             self.rollback(change)
@@ -380,8 +468,8 @@ class GitLabAccessWorkflow:
             raise WorkflowError("YAML và GitLab đã đúng role; không cần chạy Ansible.")
         # Recheck after sending the complete Git outputs to Telegram.
         try:
-            self._require_files()
-            self._validate_change(change, self.report())
+            self._require_files(change.request.repo_kind)
+            self._validate_change(change, self.report(change.request.repo_kind))
         except Exception:
             self.rollback(change)
             raise
@@ -390,29 +478,35 @@ class GitLabAccessWorkflow:
             "YAML không thay đổi; cần kiểm tra quyền GitLab đã áp dụng."
             if change.mode == "sync" else
             "Giữ diff YAML để kiểm tra; Ansible có thể đã áp dụng một phần.",
-        )
+         )
         if change.mode == "sync":
-            self._validate_change(change, self.report())
-            try:
-                access = self.access_client.project_user_access(
-                    change.request.project_path, change.request.username,
-                )
-            except WorkflowError as exc:
-                raise WorkflowError("Ansible đã chạy nhưng chưa xác minh được quyền GitLab.\n%s" % exc) from exc
-            if (change.request.access is not None
-                    and access.user_id != change.request.access.user_id):
-                raise WorkflowError("Ansible đã chạy nhưng user GitLab đã đổi; cần kiểm tra lại.")
-            if access.access_level != ROLE_LEVELS[change.request.role]:
-                raise WorkflowError(
-                    "Ansible đã chạy nhưng GitLab vẫn là %s (access_level: %s); cần role %s (%s)."
-                    % (access.role or "chưa có membership", access.access_level,
-                       change.request.role, ROLE_LEVELS[change.request.role]),
-                )
+            self._validate_change(change, self.report(change.request.repo_kind))
+            self._verify_accesses(change.request)
         return result
+
+    def _verify_accesses(self, request):
+        expected = {access.username: access.user_id for access in request.accesses}
+        if not expected and request.access is not None:
+            expected[request.access.username] = request.access.user_id
+        errors = []
+        for username in request.usernames:
+            try:
+                access = self.access_client.project_user_access(request.project_path, username)
+            except WorkflowError as exc:
+                errors.append("%s: chưa xác minh được quyền GitLab.\n%s" % (username, exc))
+                continue
+            if username in expected and access.user_id != expected[username]:
+                errors.append("%s: user GitLab đã đổi; cần kiểm tra lại." % username)
+            elif access.access_level != ROLE_LEVELS[request.role]:
+                errors.append("%s: GitLab vẫn là %s (access_level: %s); cần role %s (%s)."
+                              % (username, access.role or "chưa có membership", access.access_level,
+                                 request.role, ROLE_LEVELS[request.role]))
+        if errors:
+            raise WorkflowError("Ansible đã chạy nhưng chưa xác nhận đủ quyền.\n" + "\n".join(errors))
 
     def _run_access_playbook(self, request, failure_note):
         args = (
-            self.settings.ansible_binary, "-i", INVENTORY, PLAYBOOK,
+            self.settings.ansible_binary, "-i", INVENTORY, request.playbook,
             "--tags=" + request.namespace + ",project_user_access",
         )
         env = os.environ.copy()
@@ -427,23 +521,24 @@ class GitLabAccessWorkflow:
             raise WorkflowError("Ansible thất bại (exit %s).\n%s\n%s" % (code, detail, failure_note))
         return AccessResult(args, _recap(output))
 
-    def _return_master(self):
-        if self.report().porcelain:
+    def _return_master(self, repo_kind="ghub"):
+        if self.report(repo_kind).porcelain:
             raise WorkflowError("Repo còn thay đổi local; chưa thể trở về master/pull.")
         _git(self.repo, "checkout", REQUIRED_BRANCH, settings=self.settings)
-        _git(self.repo, "pull", "--ff-only", "origin", REQUIRED_BRANCH,
-             settings=self.settings, timeout=self.settings.git_clone_timeout_seconds)
-        self._require_clean()
-
+        _git(self.repo, "pull", "--ff-only", "origin", REQUIRED_BRANCH, settings=self.settings, timeout=self.settings.git_clone_timeout_seconds)
+        self._require_clean(repo_kind)
+ 
     def prepare_branch(self, change, state):
         if change.mode != "update":
             raise WorkflowError("Không có thay đổi YAML để tạo branch.")
         if state.action == "no" or state.push_confirmed:
             raise WorkflowError("Lượt hiện tại đã bắt đầu huỷ hoặc đã xác nhận push.")
         request = change.request
+        path = self._path(request.repo_kind)
+        access_file = request.access_file
         if not state.branch:
-            self._require_files()
-            self._validate_change(change, self.report())
+            self._require_files(request.repo_kind)
+            self._validate_change(change, self.report(request.repo_kind))
             stamp = datetime.now(timezone(timedelta(hours=7))).strftime("%Y%m%d-%H%M%S")
             branch = "bot-%s/%s/%s" % (stamp, request.namespace, request.service)
             self._git_output("check-ref-format", "--branch", branch)
@@ -454,45 +549,40 @@ class GitLabAccessWorkflow:
             self._git_output("checkout", "-b", branch)
             state.branch = branch
             state.action = "yes"
-
+ 
         if not state.commit:
-            report = self.report()
-            statuses = (" M " + ACCESS_FILE + "\x00", "M  " + ACCESS_FILE + "\x00")
-            if (report.branch != state.branch or report.head != request.head
-                    or report.porcelain not in statuses
-                    or self.path.is_symlink() or self.path.read_bytes() != change.content):
+            report = self.report(request.repo_kind)
+            statuses = (" M " + access_file + "\x00", "M  " + access_file + "\x00")
+            if (report.branch != state.branch or report.head != request.head or report.porcelain not in statuses or path.is_symlink() or path.read_bytes() != change.content):
                 raise GitCheckError("Repo đã đổi trước commit; giữ dữ liệu để kiểm tra.", report)
-            self._git_output("add", "--", ACCESS_FILE)
+            self._git_output("add", "--", access_file)
             author = self.settings.gitlab_username or "infra-bot"
             host = urlsplit(self.settings.gitlab_url).hostname or "localhost"
-            self._git_output(
-                "-c", "user.name=" + author, "-c", "user.email=%s@%s" % (author, host),
-                "commit", "-m", "gitlab-repo: Grant role %s for %s to repo %s/%s"
-                % (request.role, request.username, request.namespace, request.service),
-                "--", ACCESS_FILE,
-            )
+            self._git_output( "-c", "user.name=" + author, "-c", "user.email=%s@%s" % (author, host), "commit", "-m", "gitlab-repo: Grant role %s for %s to repo %s/%s" % (request.role, ", ".join(request.usernames), request.namespace, request.service),"--", access_file)
             state.commit = _git(self.repo, "rev-parse", "HEAD", settings=self.settings)
-
+ 
         return self.branch_push_info(change, state)
-
+ 
     def branch_push_info(self, change, state):
-        self._require_files()
+        request = change.request
+        path = self._path(request.repo_kind)
+        self._require_files(request.repo_kind)
         if not state.branch or not state.commit:
             raise WorkflowError("Chưa chuẩn bị đủ branch và commit để xác nhận push.")
-        report = self.report()
+        report = self.report(request.repo_kind)
         branch_head = _git(self.repo, "rev-parse", "refs/heads/" + state.branch, settings=self.settings)
         parent = _git(self.repo, "rev-parse", state.commit + "^", settings=self.settings)
         paths = self._git_output("diff", "--name-only", "-z", change.request.head, state.commit, "--")
         if (report.porcelain or report.branch not in (state.branch, REQUIRED_BRANCH)
                 or branch_head != state.commit or parent != change.request.head
-                or paths != ACCESS_FILE + "\x00"
-                or (report.branch == state.branch and self.path.read_bytes() != change.content)):
+                or paths != request.access_file + "\x00"
+                or (report.branch == state.branch and path.read_bytes() != change.content)):
             raise GitCheckError("Repo/branch đã đổi sau commit; dừng trước push.", report)
         return BranchPushInfo(
             branch=state.branch,
             difference=self._git_output(
                 "diff", "--no-ext-diff", "--no-textconv",
-                change.request.head, state.commit, "--", ACCESS_FILE,
+                change.request.head, state.commit, "--", request.access_file,
             ),
             commit=state.commit,
             message=_git(self.repo, "log", "-1", "--format=%s", state.commit, settings=self.settings),
@@ -509,14 +599,17 @@ class GitLabAccessWorkflow:
         finally:
             # Keep the pushed branch and retry only cleanup if returning to master fails.
             if state.pushed:
-                self._return_master()
+                self._return_master(change.request.repo_kind)
 
     def _cancel_change(self, change, state):
         if state.push_confirmed or state.pushed:
             raise WorkflowError("Đã xác nhận push; chỉ có thể thử lại Yes để hoàn tất lượt hiện tại.")
         if not state.restored:
-            self._require_files()
-            report = self.report()
+            request = change.request
+            path = self._path(request.repo_kind)
+            access_file = request.access_file
+            self._require_files(request.repo_kind)
+            report = self.report(request.repo_kind)
             if state.branch and report.branch == state.branch:
                 master_head = _git(self.repo, "rev-parse", "refs/heads/" + REQUIRED_BRANCH,
                                    settings=self.settings)
@@ -528,22 +621,22 @@ class GitLabAccessWorkflow:
                     state.action = "no"
                 else:
                     # Also allow cancellation if preparation stopped after git add.
-                    statuses = (" M " + ACCESS_FILE + "\x00", "M  " + ACCESS_FILE + "\x00")
-                    content = self.path.read_bytes()
+                    statuses = (" M " + access_file + "\x00", "M  " + access_file + "\x00")
+                    content = path.read_bytes()
                     pending_edit = report.porcelain in statuses and content == change.content
                     already_restored = not report.porcelain and content == change.request.source
                     if report.head != change.request.head or not (pending_edit or already_restored):
                         raise GitCheckError("Bản sửa trước commit đã đổi; không ghi đè khi huỷ.", report)
                     state.action = "no"
                     if pending_edit:
-                        self._git_output("reset", "HEAD", "--", ACCESS_FILE)
-                        _atomic_write(self.path, change.request.source)
+                        self._git_output("reset", "HEAD", "--", access_file)
+                        _atomic_write(path, change.request.source)
                 _git(self.repo, "checkout", REQUIRED_BRANCH, settings=self.settings)
-                report = self.report()
-            if self.path.read_bytes() == change.content:
+                report = self.report(request.repo_kind)
+            if path.read_bytes() == change.content:
                 self._validate_change(change, report)
-                _atomic_write(self.path, change.request.source)
-            elif (self.path.read_bytes() != change.request.source
+                _atomic_write(path, change.request.source)
+            elif (path.read_bytes() != change.request.source
                     or report.branch != REQUIRED_BRANCH or report.head != change.request.head
                     or report.porcelain):
                 raise GitCheckError("Repo đã đổi; không ghi đè khi khôi phục quyền.", report)
@@ -553,7 +646,7 @@ class GitLabAccessWorkflow:
                 "Đã phục hồi YAML nhưng chưa xác nhận khôi phục quyền; bấm No để thử lại.",
             )
             state.restored = True
-        self._return_master()
+        self._return_master(change.request.repo_kind)
 
     def finalize(self, change, answer, state, review=None):
         if change.mode != "update":
