@@ -2,7 +2,7 @@
 
 Tài liệu mô tả ba trường hợp đối chiếu YAML/GitLab REST API trong `/gitlab`,
 đồng bộ quyền bằng Ansible và xác nhận thông tin branch trước khi push khi cần
-sửa YAML, dựa trên source `master` ở commit `34dfd69` của
+sửa YAML, bao gồm bản sửa bước chọn role trên source `master` ở commit `2f92e62` của
 `tuanphi/infra-bot`. Các lệnh chuyển nhánh dùng `git checkout` để tương thích
 với Git trong container chưa hỗ trợ `git switch`.
 `gitlab_conversation.py` quản lý hội thoại; `gitlab_access.py` sửa YAML, chạy
@@ -32,14 +32,21 @@ flowchart TD
     G -->|Lỗi| I
 ```
 
-1. `/gitlab` → bot hiển thị **Nhập tên namespace**.
-2. Nhập `ghub-website` → bot kiểm tra namespace, hiển thị **Nhập tên service**.
-3. Nhập `merchant-portal-client` → bot kiểm tra service, hiển thị **Nhập tên user**.
-4. Nhập `tuanpv` → bot hiển thị **Chọn role**, với bốn nút:
-   `maintainer`, `developer`, `reporter`, `guest`. Mỗi yêu cầu chọn một role.
-5. Chọn `developer` → bot lấy path của service từ YAML, tra user và
+1. `/gitlab` → bot hiển thị hai nút **ghub** và **non-ghub**. Sau khi chọn,
+   bot liệt kê namespace có service và yêu cầu nhập namespace.
+2. Nhập namespace, ví dụ `ghub-website` ở ghub hoặc `devops` ở non-ghub →
+   bot kiểm tra namespace và liệt kê service.
+3. Nhập service, ví dụ `merchant-portal-client` hoặc `form-app-demo-01` →
+   bot kiểm tra service và yêu cầu nhập username GitLab.
+4. Nhập `tuanpv` hoặc danh sách user cách nhau bằng dấu phẩy, khoảng trắng,
+   xuống dòng → bot hiển thị **Chọn role**, với bốn nút:
+   `maintainer`, `developer`, `reporter`, `guest`. Role áp dụng cho toàn bộ
+   danh sách, tối đa 50 user và tự loại bỏ username trùng.
+5. Chọn `developer` → bot báo `🔎 Đang kiểm tra quyền GitLab và đối chiếu YAML...`,
+   lấy path của service từ YAML của nhóm đã chọn, tra từng user và
    membership qua GitLab REST API và phân loại. Nếu YAML/API đã đúng, bot báo
-   đã có quyền và kết thúc ngay. Nếu cần sửa YAML, bot hiển thị ví dụ:
+   đã có quyền và kết thúc ngay. Nếu cần sửa YAML, bot hiển thị kết quả từng
+   user với icon ✅/🔄/📝 và menu Yes/No. Ví dụ với ghub:
 
    ```text
    user tuanpv đang có role reporter (GitLab API)
@@ -59,11 +66,21 @@ flowchart TD
    Role hiện tại lấy từ API tại thời điểm chọn role, bao gồm membership kế thừa
    từ group mà token được phép xem. User tồn tại nhưng không có membership
    được hiển thị là `user tuanpv chưa có membership trong project (GitLab API)`.
-   Không tìm thấy user hoặc API lỗi: dừng trước menu xác nhận và sửa YAML.
+   Không tìm thấy user hoặc API lỗi: báo ❌ và dừng trước menu xác nhận và sửa YAML.
+   Lỗi nội bộ tại bước kiểm tra quyền: ghi traceback với nhãn
+   `Unexpected /gitlab preview failure`, báo ❌, xoá phiên và cho phép chạy
+   `/gitlab` lại. Danh sách được lưu và đọc thống nhất bằng `session["usernames"]`;
+   không dùng key `username` cũ ở bước chọn role.
+
+   | Nhóm | File YAML | Playbook |
+   | --- | --- | --- |
+   | ghub | `group_vars/gitlab-ghub` | `gitlab-repos-ghub.yaml` |
+   | non-ghub | `group_vars/gitlab` | `gitlab-repos.yaml` |
 
 6. Chọn **No** hoặc gửi `/cancel` → dừng, chưa sửa file/chạy Ansible.
-7. Chọn **Yes** → backend sửa YAML, gửi đầy đủ output của `git status`
-   và `git diff group_vars/gitlab-ghub`, rồi chạy Ansible nếu kiểm tra hợp lệ.
+7. Chọn **Yes** → backend sửa file YAML đã chọn cho cả danh sách, gửi đầy đủ
+   output của `git status` và `git diff <file-YAML>`, rồi chạy playbook tương
+   ứng một lần với `--tags=<namespace>,project_user_access` nếu kiểm tra hợp lệ.
    Nếu chỉ cần đồng bộ API, backend giữ nguyên YAML, chạy Ansible rồi đọc lại
    API; xác nhận thành công thì kết thúc ngay, không đi qua các bước 8–11.
 8. Ansible exit 0 → bot gửi kết quả và PLAY RECAP, sau đó hiển thị:
@@ -195,7 +212,7 @@ Tham khảo [Users API](https://docs.gitlab.com/api/users/) và
 ## Sửa YAML và xác minh Git
 
 Trước khi sửa, repo phải ở branch `master`, có working tree/index sạch, có các
-file thường `group_vars/gitlab-ghub`, `nonprod` và `gitlab-repos-ghub.yaml`.
+file thường `nonprod`, file YAML và playbook của nhóm đã chọn theo bảng ở trên.
 Repo, commit và nội dung file được kiểm tra lại sau khi user chọn Yes.
 
 - User chưa có trong YAML: thêm vào danh sách của role đã chọn.
@@ -221,9 +238,9 @@ Khi sửa YAML (`update`), backend yêu cầu đồng thời:
 
 1. Branch vẫn là `master`, HEAD vẫn là commit đã dùng để xem role.
 2. `git status --porcelain=v1 -z --untracked-files=all` chỉ có
-   ` M group_vars/gitlab-ghub`; không có file staged, untracked hoặc file khác.
+   ` M <file-YAML-đã-chọn>`; không có file staged, untracked hoặc file khác.
 3. Diff có nội dung; file trên đĩa khớp bản sửa được tính từ yêu cầu đã xác nhận.
-4. Cấu trúc YAML sau sửa chỉ đổi membership của đúng user trong service đã chọn.
+4. Cấu trúc YAML sau sửa chỉ đổi membership của danh sách user trong service đã chọn.
 
 Khi chỉ đồng bộ (`sync`), working tree/index phải sạch, diff rỗng, branch vẫn
 là `master`, HEAD và nội dung YAML phải khớp snapshot đã xác nhận. Kiểm tra lại
@@ -244,10 +261,11 @@ Backend kiểm tra lại ngay trước khi gọi subprocess, với thư mục l�
 `GIT_CLONE_DIR` (mặc định `/app/infra`) và argv cố định:
 
 ```bash
-ansible-playbook -i nonprod gitlab-repos-ghub.yaml --tags=ghub-website,project_user_access
+ansible-playbook -i nonprod <playbook-của-nhóm-đã-chọn> --tags=<namespace>,project_user_access
 ```
 
-`ghub-website` được thay bằng namespace đã chọn. Không ghép shell command từ
+Ví dụ non-ghub: `ansible-playbook -i nonprod gitlab-repos.yaml --tags=devops,project_user_access`.
+Không ghép shell command từ
 nội dung người dùng. Khóa `run_lock` dùng chung với `/run` được giữ từ lúc
 xác nhận Yes lần đầu đến khi đồng bộ/xác minh API kết thúc. Với trường hợp sửa
 YAML, khóa tiếp tục được giữ qua quyết định sau Ansible, xem thông tin branch,
@@ -258,7 +276,7 @@ trong một process.
 
 `--tags=namespace,project_user_access` chọn task khớp **một trong hai** tag;
 phạm vi thực thi còn phụ thuộc cách gắn tag/include/role trong playbook.
-Cần kiểm tra `gitlab-repos-ghub.yaml` và các task của repo infra để xác nhận
+Cần kiểm tra playbook của nhóm đã chọn và các task của repo infra để xác nhận
 phạm vi quyền thực tế. Tham khảo
 [Ansible: Selecting or skipping tags](https://docs.ansible.com/projects/ansible-core/2.13/user_guide/playbooks_tags.html#selecting-or-skipping-tags-when-you-run-a-playbook).
 
@@ -288,10 +306,10 @@ Thứ tự xử lý:
    local `master` vẫn ở commit đã preview, rồi `git checkout master` để lấy
    lại YAML gốc. Nếu chuẩn bị dừng sau `git add`, backend bỏ staging riêng file
    YAML và phục hồi nội dung trước khi checkout; không reset toàn repo.
-2. Phục hồi chính xác nội dung `group_vars/gitlab-ghub` trước khi sửa, lấy từ
+2. Phục hồi chính xác nội dung file YAML đã chọn trước khi sửa, lấy từ
    `change.request.source`, hoặc xác minh file đã khớp bản đó sau checkout.
    Giữ user/role cũ của service.
-3. Chạy lại `ansible-playbook -i nonprod gitlab-repos-ghub.yaml
+3. Chạy lại `ansible-playbook -i nonprod <playbook-của-nhóm-đã-chọn>
    --tags=<namespace>,project_user_access` trong `/app/infra`.
 4. Khi Ansible exit 0, đánh dấu đã chạy phục hồi, rồi checkout `master` và pull
    fast-forward.
@@ -329,10 +347,10 @@ bot-20261009-112708/ghub-website/merchant-portal-client
 Branch phải hợp lệ và chưa tồn tại ở local hoặc origin. Nếu trùng trong cùng
 giây, bot báo lỗi; có thể bấm Yes lại ở giây kế tiếp.
 
-Commit chỉ chứa `group_vars/gitlab-ghub`, với thông điệp:
+Commit chỉ chứa file YAML đã chọn, với thông điệp chứa tất cả username:
 
 ```text
-gitlab-repo: Grant role <role> for <user> to repo <namespace>/<service>
+gitlab-repo: Grant role <role> for <user1>, <user2> to repo <namespace>/<service>
 gitlab-repo: Grant role developer for tuanpv to repo ghub-website/merchant-portal-client
 ```
 
@@ -340,8 +358,8 @@ Các lệnh Git chuẩn bị tại local tương ứng:
 
 ```bash
 git checkout -b <branch>
-git add -- group_vars/gitlab-ghub
-git commit -m "gitlab-repo: Grant role <role> for <user> to repo <namespace>/<service>" -- group_vars/gitlab-ghub
+git add -- <file-YAML-đã-chọn>
+git commit -m "gitlab-repo: Grant role <role> for <danh-sách-user> to repo <namespace>/<service>" -- <file-YAML-đã-chọn>
 ```
 
 Lệnh commit đặt `user.name` riêng bằng `GITLAB_USERNAME` (fallback `infra-bot`)
@@ -359,11 +377,11 @@ Commit: <commit SHA>
 Commit message: gitlab-repo: Grant role developer for tuanpv to repo ghub-website/merchant-portal-client
 
 Difference:
-<git diff của file group_vars/gitlab-ghub>
+<git diff của file YAML đã chọn>
 ```
 
 Difference được lấy từ `git diff <commit trước thay đổi> <commit đã chuẩn bị>
--- group_vars/gitlab-ghub`, không lấy working-tree diff vốn đã rỗng sau commit.
+-- <file-YAML-đã-chọn>`, không lấy working-tree diff vốn đã rỗng sau commit.
 Commit phải có parent là commit đã preview và chỉ đổi đúng file YAML; branch,
 working tree và nội dung file được kiểm tra trước khi hiển thị.
 

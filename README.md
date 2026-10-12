@@ -1,15 +1,21 @@
 # Ansible Telegram bot
 
-Bot hỗ trợ `/gitlab` để nhập namespace/service/user và chọn role. Bot đối chiếu
-`group_vars/gitlab-ghub` với quyền thực tế qua GitLab REST API: đã khớp thì kết
+Bot hỗ trợ `/gitlab` để chọn **ghub/non-ghub**, nhập namespace/service, một hoặc
+nhiều username GitLab và chọn role chung. Bot đối chiếu file YAML của nhóm đã
+chọn với quyền thực tế qua GitLab REST API: đã khớp thì kết
 thúc; YAML đúng nhưng API khác thì hỏi Yes/No để chạy Ansible và xác minh lại
 API, không tạo commit/branch. Khi YAML cần thay đổi, bot hỏi Yes/No trước khi sửa
 file trên branch `master`, gửi toàn bộ Git status/diff và chạy
-`ansible-playbook -i nonprod gitlab-repos-ghub.yaml --tags=<namespace>,project_user_access`
+`ansible-playbook -i nonprod <playbook> --tags=<namespace>,project_user_access`
 khi kiểm tra hợp lệ. Với trường hợp sửa YAML, sau Ansible thành công bot hiện thêm hai nút:
 
 - **Yes:** tạo branch/commit local, hiển thị thông tin branch và hỏi xác nhận push.
 - **No:** phục hồi YAML trước thay đổi và chạy lại playbook với cấu hình cũ.
+
+| Nhóm | File YAML | Playbook |
+| --- | --- | --- |
+| ghub | `group_vars/gitlab-ghub` | `gitlab-repos-ghub.yaml` |
+| non-ghub | `group_vars/gitlab` | `gitlab-repos.yaml` |
 
 Cả hai lựa chọn đều kết thúc bằng `git checkout master` và
 `git pull --ff-only origin master`. Xem
@@ -36,26 +42,34 @@ whitelist; mặc định chỉ dùng trong nhóm đã cấu hình.
 Với `/run`, source branch **phải được commit/push từ trước**
 và có diff so với `GIT_TARGET_BRANCH`. Chạy một playbook hiện có không tự tạo
 diff cho MR. `/run` dùng source đã commit; `/gitlab` sửa membership trong file
-`group_vars/gitlab-ghub` theo cấu trúc đã cung cấp. GitLab repo không truy cập được trong môi
+YAML của nhóm đã chọn theo cấu trúc đã cung cấp. GitLab repo không truy cập được trong môi
 trường thiết kế này, do đó cần kiểm tra inventory `nonprod`, vị trí playbook
 và các dependency role/collection tại môi trường của bạn.
 
 ## Luồng /gitlab
 
-1. Gửi `/gitlab`, nhập namespace → service → username GitLab, rồi chọn một
-   role: `maintainer`, `developer`, `reporter`, `guest`.
+1. Gửi `/gitlab` → chọn ghub/non-ghub → namespace → service → username GitLab,
+   rồi chọn một role chung: `maintainer`, `developer`, `reporter`, `guest`.
+   Có thể nhập một user hoặc nhiều user cách nhau bằng dấu phẩy, khoảng trắng
+   hoặc xuống dòng; tối đa 50 user, tự loại bỏ username trùng.
 2. Bot tra user ID qua `GET /users?username=...`, lấy role hiện tại qua
    `GET /projects/<encoded-project-path>/members/all/<user-id>` và so sánh với
-   YAML theo bảng dưới. Khi cần chạy Ansible, bot hỏi Yes/No; tin nhắn gồm role,
+   YAML theo bảng dưới cho từng user. Sau khi chọn role, bot báo
+   `🔎 Đang kiểm tra quyền GitLab và đối chiếu YAML...` rồi gửi kết quả.
+   Khi cần chạy Ansible, bot hỏi Yes/No; tin nhắn gồm role,
    user ID, project, `access_level`, `expires_at` và thông báo hành động.
    No hoặc `/cancel` tại bước này kết thúc trước khi sửa file hoặc chạy Ansible.
-3. Nếu YAML đúng nhưng API khác: Yes kiểm tra lại repo `master` sạch và quyền
+   Nếu kiểm tra gặp lỗi nội bộ, bot báo ❌, ghi traceback trong log với nhãn
+   `Unexpected /gitlab preview failure`, xoá phiên và cho phép chạy `/gitlab`
+   lại. Bước này chưa sửa YAML hoặc chạy Ansible.
+3. Nếu YAML đúng cho tất cả user nhưng API khác ở ít nhất một user: Yes kiểm tra lại repo `master` sạch và quyền
    API, chạy playbook với YAML hiện có, đọc lại API xác nhận đúng `access_level`
    đã chọn rồi kết thúc, nhả khóa. Không có bước commit/branch/push.
    Nếu API đã đúng trước lúc bấm Yes, bot báo đã có quyền và bỏ qua Ansible.
    **Các bước 4–10 dưới đây chỉ áp dụng khi YAML cần thay đổi.**
-4. Yes: bot kiểm tra repo `master` sạch, sửa đúng membership trong
-   `group_vars/gitlab-ghub`, gửi Git status/diff và chạy playbook Ghub.
+4. Nếu có user cần sửa YAML, Yes: bot kiểm tra repo `master` sạch, sửa membership
+   của danh sách trong file YAML đã chọn, gửi Git status/diff và chạy playbook
+   tương ứng một lần cho cả lượt.
 5. Ansible exit 0: bot gửi kết quả/PLAY RECAP và menu:
 
    ```text
@@ -73,7 +87,7 @@ và các dependency role/collection tại môi trường của bạn.
    Commit message:
 
    ```text
-   gitlab-repo: Grant role <role> for <user> to repo <namespace>/<service>
+   gitlab-repo: Grant role <role> for <user1>, <user2> to repo <namespace>/<service>
    ```
 
 7. Bot gửi **Thông tin branch trước khi push** gồm branch, commit SHA,
@@ -83,7 +97,7 @@ và các dependency role/collection tại môi trường của bạn.
    lên `origin`. Luồng `/gitlab` kết thúc sau push và checkout/pull; không gọi API tạo MR.
 9. No sau Ansible hoặc No tại menu xác nhận push: phục hồi chính xác YAML
    trước khi sửa, rồi chạy lại
-   `ansible-playbook -i nonprod gitlab-repos-ghub.yaml
+   `ansible-playbook -i nonprod <playbook-của-nhóm-đã-chọn>
    --tags=<namespace>,project_user_access` để áp dụng cấu hình cũ.
    Nếu đã tạo commit local để xem thông tin branch, backend kiểm tra bản nháp và checkout
    lại `master` gốc trước khi chạy playbook với YAML cũ. Branch/commit local
@@ -92,9 +106,9 @@ và các dependency role/collection tại môi trường của bạn.
 
 | Trường hợp | Xử lý | Thông báo chính |
 | --- | --- | --- |
-| YAML và API đều đúng role chọn | Kết thúc ngay, không chạy Ansible | ✅ `<user>` đã có role `<role>` tại `<namespace>/<service>`. YAML và GitLab đã khớp. |
-| YAML đúng, API khác | Xác nhận Yes → Ansible → đọc lại API → kết thúc | 🔄 YAML đã đúng; đang chạy Ansible để đồng bộ GitLab. Sau xác minh: ✅ Đã đồng bộ quyền. `<namespace>/<service>: <user> → <role>` (GitLab API xác nhận). |
-| YAML cần thay đổi | Sửa YAML → Ansible → xác nhận push branch | 📝 Đã cập nhật YAML; đang chạy Ansible. Sau thành công: ✅ Ansible thành công. |
+| YAML và API đúng role chọn cho tất cả user | Kết thúc ngay, không chạy Ansible | ✅ `<danh sách user>` đã có role `<role>` tại `<namespace>/<service>`. YAML và GitLab đã khớp. |
+| YAML đúng cho tất cả user, API khác ở ít nhất một user | Xác nhận Yes → Ansible → đọc lại API cho tất cả user → kết thúc | 🔄 YAML đã đúng; đang chạy Ansible để đồng bộ GitLab. Sau xác minh: ✅ Đã đồng bộ quyền. `<namespace>/<service>: <danh sách user> → <role>` (GitLab API xác nhận). |
+| Ít nhất một user cần sửa YAML | Sửa YAML → Ansible → xác nhận push branch | 📝 Đã cập nhật YAML; đang chạy Ansible. Sau thành công: ✅ Ansible thành công. |
 
 Đối chiếu API dùng đúng mã role (`developer=30`, không chỉ so sánh tên hiển thị).
 Nếu Ansible lỗi, API lỗi hoặc quyền sau đồng bộ vẫn khác role chọn, bot báo

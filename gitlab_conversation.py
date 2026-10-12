@@ -209,22 +209,24 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
         role = update.callback_query.data.rsplit(":", 1)[1]
         await update.callback_query.edit_message_text("Đã chọn role: " + role)
         try:
+            await reply_full(update.effective_message, "🔎 Đang kiểm tra quyền GitLab và đối chiếu YAML...")
             request = await backend(workflow.preview, session["namespace"], session["service"],
-                                    session["username"], role, session["repo_kind"])
+                                    session["usernames"], role, session["repo_kind"])
         except WorkflowError as exc:
             if isinstance(exc, GitCheckError):
                 await reply_git_report(update.effective_message, exc.report)
             await reply_full(update.effective_message, "❌ " + str(exc))
             await clear_session(update, ctx)
             return ConversationHandler.END
-        session["request"] = request
-        if request.mode == "unchanged":
-            await reply_full(
-                update.effective_message,
-                "✅ %s đã có role %s tại %s/%s. YAML và GitLab đã khớp."
-                % (request.username, request.role, request.namespace, request.service),
-            )
-            await clear_session(update, ctx)
+        except Exception:
+            logging.exception("Unexpected /gitlab preview failure")
+            try:
+                await reply_full(
+                    update.effective_message,
+                    "❌ Không kiểm tra được quyền do lỗi nội bộ. Chạy /gitlab để thử lại; kiểm tra log bot.",
+                )
+            finally:
+                await clear_session(update, ctx)
             return ConversationHandler.END
         session["request"] = request
         if request.mode == "unchanged":
