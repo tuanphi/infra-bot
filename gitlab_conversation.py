@@ -2,11 +2,13 @@
 
 import asyncio
 from functools import partial
+from html import escape
 import logging
 import secrets
 import warnings
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from telegram.ext import CallbackQueryHandler, CommandHandler, ConversationHandler, MessageHandler, filters
 from telegram.warnings import PTBUserWarning
@@ -42,8 +44,9 @@ def telegram_chunks(text, limit=3500):
 
 
 async def reply_full(message, text):
+    """Send complete output as quotes, splitting before escaping HTML."""
     for chunk in telegram_chunks(text):
-        await message.reply_text(chunk, parse_mode=None)
+        await message.reply_text("<blockquote>" + escape(chunk) + "</blockquote>", parse_mode=ParseMode.HTML)
 
 
 async def reply_git_report(message, report):
@@ -467,8 +470,8 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
                     )
                     return
                 await reply_git_report(message, change.report)
-                await message.reply_text(
-                    "%s\nansible-playbook -i nonprod %s --tags=%s,project_user_access"
+                await reply_full(
+                    message, "%s\nansible-playbook -i nonprod %s --tags=%s,project_user_access --extra-vars=@group_vars/gitlab-bot"
                     % ("🔄 YAML đã đúng; đang chạy Ansible để đồng bộ GitLab."
                        if change.mode == "sync" else "📝 Đã cập nhật YAML; đang chạy Ansible.",
                        request.playbook, request.namespace),
@@ -547,7 +550,7 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
                 await reply_full(message, "✅ Đã đẩy branch lên repo.\nBranch: %s\nCommit: %s\nĐã về master và git pull --ff-only."
                                  % (state.branch, state.commit[:12]))
             else:
-                await message.reply_text("✅ Đã phục hồi YAML và chạy lại Ansible với cấu hình cũ.\nĐã về master và git pull --ff-only.")
+                await reply_full(message, "✅ Đã phục hồi YAML và chạy lại Ansible với cấu hình cũ.\nĐã về master và git pull --ff-only.")
         except TelegramError:
             logging.exception("Finalization completed but Telegram reply failed")
         finally:
@@ -618,7 +621,7 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
 
     async def use_buttons(update, ctx):
         if await authorized(update):
-            await update.effective_message.reply_text("Bấm nút ghub/non-ghub, project, service, role hoặc Yes/No ở tin nhắn của bot; dùng /cancel để dừng.")
+            await update.effective_message.reply_text("Bấm nút ghub/non-ghub, project, service, role hoặc Yes/No ở tin nhắn của bot; dùng /cancle để dừng.")
 
     async def stale_callback(update, ctx):
         command = "/reset" if ":reset" in update.callback_query.data else "/gitlab"
@@ -652,13 +655,13 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
                 CONFIRM: [CallbackQueryHandler(confirmation_input, pattern=r"^gitlab:[0-9a-f]{12}:confirm:(yes|no)$"),
                           MessageHandler(text, use_buttons)],
             },
-            fallbacks=[CommandHandler("cancel", cancel)],
+            fallbacks=[CommandHandler(["cancle", "cancel"], cancel)],
             allow_reentry=True, per_chat=True, per_user=True, per_message=False,
         )
     return (
         conversation,
         CallbackQueryHandler(final_input, pattern=r"^gitlab:[0-9a-f]{12}:final:(yes|no)$"),
         CallbackQueryHandler(push_input, pattern=r"^gitlab:[0-9a-f]{12}:push:(yes|no)$"),
-        CommandHandler("cancel", cancel),
+        CommandHandler(["cancle", "cancel"], cancel),
         CallbackQueryHandler(stale_callback, pattern=r"^gitlab:"),
     )

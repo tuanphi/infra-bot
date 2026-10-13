@@ -2,7 +2,7 @@
 
 Tài liệu mô tả ba trường hợp đối chiếu YAML/GitLab REST API trong `/gitlab`,
 đồng bộ quyền bằng Ansible và xác nhận thông tin branch trước khi push khi cần
-sửa YAML, `/reset` và chạy Ansible với dữ liệu namespace đã chọn, dựa trên source `master` ở commit `b40610e` của
+sửa YAML, `/reset` và chọn project/service bằng nút, dựa trên source `master` ở commit `28ebf63` của
 `tuanphi/infra-bot`. Các lệnh chuyển nhánh dùng `git checkout` để tương thích
 với Git trong container chưa hỗ trợ `git switch`.
 `gitlab_conversation.py` quản lý hội thoại; `gitlab_access.py` sửa YAML, chạy
@@ -33,11 +33,12 @@ flowchart TD
 ```
 
 1. `/gitlab` → bot hiển thị hai nút **ghub** và **non-ghub**. Sau khi chọn,
-   bot liệt kê namespace có service và yêu cầu nhập namespace.
-2. Nhập namespace, ví dụ `ghub-website` ở ghub hoặc `devops` ở non-ghub →
-   bot kiểm tra namespace và liệt kê service.
-3. Nhập service, ví dụ `merchant-portal-client` hoặc `form-app-demo-01` →
-   bot kiểm tra service và yêu cầu nhập username GitLab.
+   bot hiện **📁 Chọn project** cùng nút cho các namespace có service.
+2. Bấm namespace, ví dụ `ghub-website` ở ghub hoặc `bankgateway` ở non-ghub →
+   bot kiểm tra namespace và hiện **📁 Chọn service** cùng các nút service.
+3. Bấm service, ví dụ `merchant-portal-client` hoặc `napas-operation` →
+   bot lưu service và yêu cầu nhập username GitLab. Hai menu có tối đa 12
+   lựa chọn/trang, hai nút/hàng và ⬅️/➡️ khi cần; không nhập tên bằng text.
 4. Nhập `tuanpv` hoặc danh sách user cách nhau bằng dấu phẩy, khoảng trắng,
    xuống dòng → bot hiển thị **Chọn role**, với bốn nút:
    `maintainer`, `developer`, `reporter`, `guest`. Role áp dụng cho toàn bộ
@@ -46,17 +47,20 @@ flowchart TD
    lấy path của service từ YAML của nhóm đã chọn, tra từng user và
    membership qua GitLab REST API và phân loại. Nếu YAML/API đã đúng, bot báo
    đã có quyền và kết thúc ngay. Nếu cần sửa YAML, bot hiển thị kết quả từng
-   user với icon ✅/🔄/📝 và menu Yes/No. Ví dụ với ghub:
+   user với icon ✅/🔄/📝 và menu Yes/No. Ví dụ với non-ghub:
 
    ```text
-   user tuanpv đang có role reporter (GitLab API)
-   User ID: 123
-   Project: development/ghub-website/merchant-portal-client
-   access_level: 20
-   expires_at: none
-   Namespace: ghub-website
-   Service: merchant-portal-client
-   Role được chọn: developer
+   🗂 Nhóm: non-ghub
+   📁 Namespace: bankgateway
+   🧩 Service: napas-operation
+   🔗 Project: development/bankgateway/napas-operation
+   🛡 Role được chọn: developer
+
+   👤 tuanpv: 📝 cần sửa YAML
+   🔎 GitLab API: reporter
+   🔢 access_level: 20
+   🆔 User ID: 213
+   📅 expires_at: none
 
    📝 Sẽ cập nhật YAML và chạy Ansible.
    Bạn có muốn tiếp tục?
@@ -65,7 +69,7 @@ flowchart TD
 
    Role hiện tại lấy từ API tại thời điểm chọn role, bao gồm membership kế thừa
    từ group mà token được phép xem. User tồn tại nhưng không có membership
-   được hiển thị là `user tuanpv chưa có membership trong project (GitLab API)`.
+   được hiển thị là `🔎 GitLab API: chưa có membership`.
    Không tìm thấy user hoặc API lỗi: báo ❌ và dừng trước menu xác nhận và sửa YAML.
    Lỗi nội bộ tại bước kiểm tra quyền: ghi traceback với nhãn
    `Unexpected /gitlab preview failure`, báo ❌, xoá phiên và cho phép chạy
@@ -105,6 +109,10 @@ Chỉ Telegram user thuộc `ALLOWED_USER_IDS`, trong `ALLOWED_GROUP_ID`, mới 
 thể áp dụng lại yêu cầu. Phiên được đối chiếu theo chat, user, nonce và message ID.
 Ba bước xác nhận dùng callback riêng: trước Ansible là `:confirm:`, sau
 Ansible là `:final:`, và xác nhận push sau khi xem thông tin branch là `:push:`.
+Menu project/service dùng `:namespace:<index>`, `:service:<index>` và các
+callback phân trang `:namespacepage:<page>`, `:servicepage:<page>`. Chỉ số tham
+chiếu danh sách đã lưu trong phiên; tên dài không đưa vào callback_data.
+Các nút cũng được kiểm tra nonce/message ID và quyền của người dùng.
 
 `/gitlab` có thể khởi tạo lại phiên trước khi xác nhận. Sau khi xác nhận Yes
 lần đầu, `/cancel` không huỷ tác vụ đang chạy. Khi đang chờ quyết định sau
@@ -316,10 +324,8 @@ thêm đúng service đã chọn (devops: 1/258 project), `/reset` giữ toàn b
 (devops: 9/258 project). YAML chính và diff tiếp tục theo luồng hiện có,
 các namespace/service khác được giữ nguyên.
 
-Runner đo tổng thời gian bằng monotonic clock. Callback
-`ansible_callbacks/bot_timing.py` thu thời gian từng task; bot trả tối đa 5
-task tốn thời gian nhất cùng PLAY RECAP để tìm phần còn chậm. Cần copy thư
-mục callback vào image theo Dockerfile mới. Chưa có phép đo trên GitLab nội bộ.
+Runner đo tổng thời gian chạy Ansible bằng monotonic clock và trả số project
+đã truyền cùng PLAY RECAP. Chưa có phép đo trên GitLab nội bộ.
 
 Trường hợp chỉ đồng bộ: Ansible exit 0 chưa đủ để báo thành công. Bot đọc lại
 API và chỉ gửi ✅ đã đồng bộ khi mã role khớp, kèm PLAY RECAP nếu có; kết thúc
@@ -412,12 +418,12 @@ toàn cục trong container. Push dùng credential helper hiện có, không for
 Bot gửi đầy đủ thông tin, chia thành nhiều tin nhắn nếu vượt giới hạn Telegram:
 
 ```text
-Thông tin branch trước khi push
-Branch: bot-20261009-112708/ghub-website/merchant-portal-client
-Commit: <commit SHA>
-Commit message: gitlab-repo: Grant role developer for tuanpv to repo ghub-website/merchant-portal-client
+🔎 Thông tin branch trước khi push
+🌿 Branch: bot-20261009-112708/ghub-website/merchant-portal-client
+🆔 Commit: <commit SHA>
+📝 Commit message: gitlab-repo: Grant role developer for tuanpv to repo ghub-website/merchant-portal-client
 
-Difference:
+📋 Difference:
 <git diff của file YAML đã chọn>
 ```
 
@@ -429,8 +435,9 @@ working tree và nội dung file được kiểm tra trước khi hiển thị.
 Sau thông tin, bot hiện:
 
 ```text
-Bạn có muốn đẩy branch lên repo không?
-Yes: Push branch / No: Huỷ thay đổi
+🚀 Bạn có muốn đẩy branch lên repo không?
+✅ Yes: Push branch
+❌ No: Huỷ thay đổi
 ```
 
 - **Yes:** kiểm tra lại branch, diff, SHA và commit message khớp chính xác
@@ -503,8 +510,8 @@ GIT_CLONE_DIR=/app/infra
 GITLAB_PROJECT_ID=devops/ansible/infra
 ```
 
-Các module và thư mục `ansible_callbacks` được COPY vào image theo Dockerfile
-mới. Build kiểm tra cú pháp trước khi tạo image. PyYAML 6.0.1 được cài từ requirements.
+Các module được COPY vào image theo Dockerfile mới. Build kiểm tra cú pháp
+trước khi tạo image. PyYAML 6.0.1 được cài từ requirements.
 Giữ cấu hình xác thực GitLab/Telegram hiện có; token cần quyền đọc/push repo
 Ansible và quyền API tìm/tạo MR trong project đó; đồng thời cần quyền đọc user,
 project service và membership để tra role. API Python dùng trust store TLS
@@ -518,14 +525,16 @@ HTTP `/health` giữ hành vi hiện có.
 
 ## Kiểm chứng
 
-39 test luồng trong `tests/test_gitlab_access.py` dùng Git thật và API/Ansible/
+45 test luồng trong `tests/test_gitlab_access.py` dùng Git thật và API/Ansible/
 Telegram mô phỏng. Bao gồm cả hai nhóm, một/nhiều user, ba trường hợp YAML/API,
 No sau commit local, xác nhận push, /reset kéo master mới, repo dirty/master
 chưa push, paging và callback cũ, khóa phiên và cleanup file tạm khi lỗi/timeout.
+Menu project/service được kiểm tra ở cả hai nhóm, gồm phân trang, tên dài,
+index sai, nhập tay, lỗi đọc service và icon trong thông tin quyền/menu push.
 
 3 test trong `tests/test_scoped_ansible.py` chạy Ansible thật trên localhost:
 extra-vars thay dữ liệu inventory/vars_files/cfg merge, /reset ghub dùng
-playbook chung với dữ liệu ghub, /gitlab chỉ chạy đúng service và callback timing.
+playbook chung với dữ liệu ghub và /gitlab chỉ chạy đúng service.
 Môi trường: Python 3.8.20, ansible-core 2.12.10, Jinja2 2.10.1.
 Chưa xác minh trên GitLab nội bộ thật.
 

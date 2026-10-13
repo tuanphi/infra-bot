@@ -1,24 +1,32 @@
 """A minimal Telegram interface for the Gitlab Ansible workflow."""
 
 import asyncio
-from functools import partial
 import logging
+import os
 import re
 import warnings
+from pathlib import Path
+from types import SimpleNamespace
 
 warnings.filterwarnings(
     "ignore",
     message=r"Python 3\.8 is no longer supported by the Python core team.*",
 )
 
-from telegram import Update
+from telegram import BotCommand, BotCommandScopeChat, Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-from config import Settings, load_env_file
 from gitlab_access import GitLabAccessWorkflow
 from gitlab_conversation import create_gitlab_conversation
 from runtime import prepare_repository, start_health_server
-from workflow import Pipeline, WorkflowError
+
+
+BOT_COMMANDS = (
+    BotCommand("gitlab", "🔐 Phân quyền repo GitLab"),
+    BotCommand("cancle", "🛑 Dừng lượt hiện tại trước khi xác nhận"),
+    BotCommand("reset", "♻️ Lấy master và đồng bộ quyền namespace"),
+    BotCommand("help", "❓ Hướng dẫn sử dụng bot"),
+)
 
 
 class TelegramSafeFormatter(logging.Formatter):
@@ -90,8 +98,14 @@ def log_access_policy(settings):
 
 
 def build_application(settings):
-    pipeline = Pipeline(settings)
     run_lock = asyncio.Lock()
+
+    async def register_commands(application):
+        await application.bot.set_my_commands(BOT_COMMANDS)
+        if settings.allowed_group_id < 0:
+            await application.bot.set_my_commands(
+                BOT_COMMANDS, scope=BotCommandScopeChat(settings.allowed_group_id),
+            )
 
     async def authorized(update: Update):
         status = authorization_status(settings, update)
@@ -129,54 +143,50 @@ def build_application(settings):
             await update.effective_message.reply_text(
                 "Dùng /gitlab để chọn ghub/non-ghub, project/service bằng nút, nhập danh sách user và chọn role chung. "
                 "Dùng /reset để chọn nhóm/namespace, lấy master và chạy lại quyền theo YAML.\n"
-                "Dùng /cancel để dừng trước khi xác nhận.\n"
-                "Dùng /whoami để xem chat_id, user_id và quyền truy cập.\n"
-                "Dùng /run <source-branch> để chạy playbook GitLab trên branch đã commit "
-                "và tạo GitLab MR nếu Ansible thành công."
+                "Dùng /cancle (hoặc /cancel) để dừng trước khi xác nhận.\n"
+                "Dùng /help để xem hướng dẫn.\n"
+                "Dùng /whoami để xem chat_id, user_id và quyền truy cập."
             )
 
-    async def run_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        if not await authorized(update):
-            return
-        if len(ctx.args) != 1:
-            await update.effective_message.reply_text("Cú pháp: /run <source-branch>")
-            return
-        if run_lock.locked():
-            await update.effective_message.reply_text("Đang có một lượt Ansible chạy; thử lại sau.")
-            return
-
-        async with run_lock:
-            await update.effective_message.reply_text("Đang lấy source và chạy Ansible...")
-            try:
-                loop = asyncio.get_running_loop()
-                result = await loop.run_in_executor(
-                    None, partial(pipeline.run, ctx.args[0], update.effective_user.id)
-                )
-            except WorkflowError as exc:
-                await update.effective_message.reply_text("❌ " + str(exc)[:3500])
-                return
-            except Exception:
-                logging.exception("Unexpected workflow failure")
-                await update.effective_message.reply_text("❌ Lỗi nội bộ; kiểm tra log bot.")
-                return
-            await update.effective_message.reply_text(
-                "✅ Ansible thành công.\nCommit: %s\nMR: %s\n\n%s"
-                % (result.commit[:12], result.mr_url, result.recap[:1800])
-            )
-
-    app = ApplicationBuilder().token(settings.telegram_token).concurrent_updates(False).build()
+    app = (ApplicationBuilder().token(settings.telegram_token).concurrent_updates(False)
+           .post_init(register_commands).build())
     app.add_handler(CommandHandler(["whoami", "id"], whoami_command))
     for handler in create_gitlab_conversation(GitLabAccessWorkflow(settings), run_lock, authorized):
         app.add_handler(handler)
     app.add_handler(CommandHandler("start", help_command))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("run", run_command))
     return app
 
 
 def main():
-    load_env_file("/mnt/secrets/.env", override=False)
-    settings = Settings.from_env()
+    env_values = {}
+    for raw in Path("/mnt/secrets/.env").read_text(encoding="utf-8-sig").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        name, value = re.sub(r"^export\s+", "", line).split("=", 1)
+        value = value.strip()
+        if len(value) >= 2 and value[0] in ("'", '"') and value[-1] == value[0]:
+            value = value[1:-1]
+        env_values[name.strip()] = value
+    for name, value in env_values.items():
+        os.environ.setdefault(name, value)
+    settings = SimpleNamespace(
+        telegram_token=os.environ["TELEGRAM_TOKEN"],
+        allowed_group_id=int(os.environ["ALLOWED_GROUP_ID"]),
+        allowed_user_ids=frozenset(int(item.strip()) for item in os.environ["ALLOWED_USER_IDS"].split(",") if item.strip()),
+        git_repo_url=os.environ["GIT_REPO_URL"],
+        git_target_branch=os.environ["GIT_TARGET_BRANCH"],
+        gitlab_url=os.environ["GITLAB_URL"].rstrip("/"),
+        gitlab_token=os.environ["GITLAB_TOKEN"],
+        gitlab_username=os.getenv("GITLAB_USERNAME", "").strip(),
+        allow_private_chat=os.getenv("ALLOW_PRIVATE_CHAT", "false").strip().lower() in ("true", "1"),
+        ansible_binary=os.getenv("ANSIBLE_PLAYBOOK_BIN", "ansible-playbook"),
+        ansible_timeout_seconds=int(os.getenv("ANSIBLE_TIMEOUT_SECONDS", "1800")),
+        git_clone_dir=os.getenv("GIT_CLONE_DIR", "/app/infra").strip(),
+        git_clone_timeout_seconds=int(os.getenv("GIT_CLONE_TIMEOUT_SECONDS", "180")),
+        health_port=int(os.getenv("HEALTH_PORT", "8080")),
+    )
     log_access_policy(settings)
     prepare_repository(settings)
     health = start_health_server(port=settings.health_port)
