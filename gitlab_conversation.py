@@ -62,14 +62,11 @@ def already_granted(request):
 
 
 def access_summary(request):
-    lines = ["🗂 Nhóm: %s\n📁 Namespace: %s\n🧩 Service: %s\n🔗 Project: %s\n🛡 Role được chọn: %s"
+    lines = ["🗂 Nhóm: %s\n🏠 Namespace: %s\n🧩 Service: %s\n🔗 Project: %s\n🛡 Role được chọn: %s"
              % (request.repo_kind, request.namespace, request.service, request.project_path, request.role)]
     modes = {"unchanged": "✅ đã có quyền", "sync": "🔄 cần đồng bộ GitLab", "update": "📝 cần sửa YAML"}
     for access, mode in zip(request.accesses, request.user_modes):
-        lines.append("👤 %s: %s\n🔎 GitLab API: %s\n🔢 access_level: %s\n🆔 User ID: %s\n📅 expires_at: %s"
-                     % (access.username, modes[mode], access.role or "chưa có membership",
-                        access.access_level if access.access_level is not None else "none",
-                        access.user_id, access.expires_at or "none"))
+        lines.append("👤 %s: %s\n🔎 Role trước đó: %s" % (access.username, modes[mode], access.role or "chưa có membership"))
     return "\n\n".join(lines)
 
 
@@ -97,12 +94,39 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
             except TelegramError:
                 pass
 
+    async def show_repository_menu(message, session):
+        for key in ("request", "repo_kind", "namespace", "service", "services", "namespaces", "usernames"):
+            session.pop(key, None)
+        session.update(nonce=secrets.token_hex(6), stage="collecting", selection_state=REPOSITORY)
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(kind, callback_data="gitlab:%s:repo:%s" % (session["nonce"], kind))
+            for kind in ("ghub", "non-ghub")
+        ]])
+        text = "📁 Chọn nhóm repo"
+        if session.get("changes"):
+            text += "\n📚 Đã giữ YAML của %s lượt; chưa chạy Ansible." % len(session["changes"])
+        menu = await message.reply_text(text, reply_markup=keyboard)
+        session["menu_id"] = menu.message_id
+        return REPOSITORY
+
+    async def selection_error(update, ctx, session):
+        if session.get("changes"):
+            await reply_full(update.effective_message, "📌 Các lượt trước vẫn được giữ. Chọn lại hoặc /cancle để huỷ YAML.")
+            return await show_repository_menu(update.effective_message, session)
+        if session.get("active"):
+            run_lock.release()
+        await clear_session(update, ctx)
+        return ConversationHandler.END
+
     async def reset_start(update, ctx):
         if not await authorized(update):
             return ConversationHandler.END
         session = get_session(update, ctx)
         if session and session.get("active"):
-            if session.get("stage") in ("decision", "review"):
+            if session.get("stage") == "collecting":
+                await update.effective_message.reply_text("📚 Đang gom quyền trong /gitlab; hoàn tất hoặc /cancle trước khi /reset.")
+                return session.get("selection_state", REPOSITORY)
+            if session.get("stage") in ("decision", "review", "failed"):
                 await show_pending_menu(update.effective_message, session)
             else:
                 await update.effective_message.reply_text("Lượt hiện tại đang xử lý; vui lòng chờ.")
@@ -147,6 +171,7 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
         session["menu_id"] = menu.message_id
 
     async def show_namespaces(message, session, page=0):
+        session["selection_state"] = NAMESPACE
         await show_selection_menu(
             message, session, session["namespaces"],
             "📁 Chọn project\n🗂 Nhóm: " + session["repo_kind"],
@@ -154,9 +179,10 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
         )
 
     async def show_services(message, session, page=0):
+        session["selection_state"] = SERVICE
         await show_selection_menu(
             message, session, session["services"],
-            "📁 Chọn service\n🗂 Nhóm: %s\n📁 Namespace: %s" % (session["repo_kind"], session["namespace"]),
+            "📁 Chọn service\n🗂 Nhóm: %s\n🏠 Namespace: %s" % (session["repo_kind"], session["namespace"]),
             "service", "servicepage", page,
         )
 
@@ -240,7 +266,9 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
             return ConversationHandler.END
         session = get_session(update, ctx)
         if session and session.get("active"):
-            if session.get("stage") in ("decision", "review"):
+            if session.get("stage") == "collecting":
+                return await show_repository_menu(update.effective_message, session)
+            if session.get("stage") in ("decision", "review", "failed"):
                 await show_pending_menu(update.effective_message, session)
             else:
                 await update.effective_message.reply_text("Lượt hiện tại đang xử lý; vui lòng chờ.")
@@ -249,17 +277,9 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
             await update.effective_message.reply_text("Repo đang được xử lý hoặc chờ Yes/No; thử lại sau.")
             return ConversationHandler.END
         await clear_session(update, ctx)
-        session = {
-            "nonce": secrets.token_hex(6), "chat_id": update.effective_chat.id,
-         }
+        session = {"nonce": secrets.token_hex(6), "chat_id": update.effective_chat.id, "changes": []}
         ctx.user_data.setdefault(SESSION_KEY, {})[update.effective_chat.id] = session
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton(kind, callback_data="gitlab:%s:repo:%s" % (session["nonce"], kind))
-            for kind in ("ghub", "non-ghub")
-        ]])
-        message = await update.effective_message.reply_text("📁 Chọn nhóm repo", reply_markup=keyboard)
-        session["menu_id"] = message.message_id
-        return REPOSITORY
+        return await show_repository_menu(update.effective_message, session)
 
     async def repository_input(update, ctx):
         session = await callback_session(update, ctx)
@@ -273,8 +293,7 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
                 raise WorkflowError("Nhóm %s chưa có namespace chứa service." % repo_kind)
         except WorkflowError as exc:
             await reply_full(update.effective_message, "❌ " + str(exc))
-            await clear_session(update, ctx)
-            return ConversationHandler.END
+            return await selection_error(update, ctx, session)
         session.update(repo_kind=repo_kind, namespaces=namespaces, menu_id=None)
         await show_namespaces(update.effective_message, session)
         return NAMESPACE
@@ -303,8 +322,7 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
                 logging.exception("Unexpected /gitlab service lookup failure")
             await reply_full(update.effective_message, "❌ " + (str(exc) if isinstance(exc, WorkflowError)
                                                               else "Không đọc được service; kiểm tra log bot."))
-            await clear_session(update, ctx)
-            return ConversationHandler.END
+            return await selection_error(update, ctx, session)
         session.update(namespace=namespace, services=services, menu_id=None)
         await show_services(update.effective_message, session)
         return SERVICE
@@ -323,7 +341,7 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
             await update.effective_message.reply_text("❌ Lựa chọn service không hợp lệ; bấm nút trong menu hiện tại.")
             return SERVICE
         await update.callback_query.edit_message_reply_markup(reply_markup=None)
-        session.update(service=session["services"][index], menu_id=None)
+        session.update(service=session["services"][index], menu_id=None, selection_state=USER)
         await update.effective_message.reply_text(
             "👥 Nhập username GitLab, cách nhau bằng dấu phẩy, khoảng trắng hoặc xuống dòng.\nVí dụ: anhtn, tuanpv",
         )
@@ -338,7 +356,7 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
             await reply_full(update.effective_message, "❌ " + str(exc))
             return USER
         session = get_session(update, ctx)
-        session["usernames"] = usernames
+        session.update(usernames=usernames, selection_state=ROLE)
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton(role, callback_data="gitlab:%s:role:%s" % (session["nonce"], role))]
             for role in ROLES
@@ -371,25 +389,21 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
         try:
             await reply_full(update.effective_message, "🔎 Đang kiểm tra quyền GitLab và đối chiếu YAML...")
             request = await backend(workflow.preview, session["namespace"], session["service"],
-                                    session["usernames"], role, session["repo_kind"])
+                                    session["usernames"], role, session["repo_kind"], tuple(session["changes"]))
         except WorkflowError as exc:
             if isinstance(exc, GitCheckError):
                 await reply_git_report(update.effective_message, exc.report)
             await reply_full(update.effective_message, "❌ " + str(exc))
-            await clear_session(update, ctx)
-            return ConversationHandler.END
+            return await selection_error(update, ctx, session)
         except Exception:
             logging.exception("Unexpected /gitlab preview failure")
-            try:
-                await reply_full(
-                    update.effective_message,
-                    "❌ Không kiểm tra được quyền do lỗi nội bộ. Chạy /gitlab để thử lại; kiểm tra log bot.",
-                )
-            finally:
-                await clear_session(update, ctx)
-            return ConversationHandler.END
+            await reply_full(
+                update.effective_message,
+                "❌ Không kiểm tra được quyền do lỗi nội bộ. Chạy /gitlab để thử lại; kiểm tra log bot.",
+            )
+            return await selection_error(update, ctx, session)
         session["request"] = request
-        if request.mode == "unchanged":
+        if request.mode == "unchanged" and not session["changes"]:
             await reply_full(
                 update.effective_message,
                 already_granted(request),
@@ -398,15 +412,18 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
             return ConversationHandler.END
         await reply_full(update.effective_message, access_summary(request))
         notice = ("🔄 YAML đã đúng; sẽ đồng bộ quyền trên GitLab." if request.mode == "sync" else
+                  "✅ Lượt này đã có quyền; các lượt trước vẫn được giữ." if request.mode == "unchanged" else
                   "📝 Sẽ cập nhật YAML và chạy Ansible.")
+        await reply_full(update.effective_message, notice)
         keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton("Yes", callback_data="gitlab:%s:confirm:yes" % session["nonce"]),
             InlineKeyboardButton("No", callback_data="gitlab:%s:confirm:no" % session["nonce"]),
         ]])
         message = await update.effective_message.reply_text(
-           "%s\nBạn có muốn tiếp tục?" % notice, reply_markup=keyboard,
+            "❓ Bạn có muốn tiếp tục thêm quyền user\n",
+            reply_markup=keyboard,
         )
-        session["menu_id"] = message.message_id
+        session.update(menu_id=message.message_id, selection_state=CONFIRM)
         return CONFIRM
 
     def final_choices(session):
@@ -425,6 +442,7 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
             ) for answer in choices
         ]])
         text = ("Thử lại %s để hoàn tất lượt hiện tại." % choices[0].title() if len(choices) == 1 else
+                "Yes: Chạy lại Ansible toàn bộ phiên / No: Phục hồi YAML và quyền cũ" if session.get("stage") == "failed" else
                 "Yes: Tạo và đẩy branch lên repo / No: Huỷ thay đổi")
         menu = await message.reply_text(text, reply_markup=keyboard)
         session["menu_id"] = menu.message_id
@@ -455,60 +473,51 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
 
     async def apply_request(update, ctx, session):
         message = update.effective_message
-        request = session["request"]
-        # confirmation_input acquired the shared lock before creating this task.
-        awaiting_decision = False
+        changes = tuple(session["changes"])
+        has_updates = any(change.mode == "update" for change in changes)
+        keep_session = False
+        tested = False
         try:
-            change = None
-            playbook_started = False
+            await reply_git_report(message, await backend(workflow.batch_report, changes))
+            if any(change.mode != "unchanged" for change in changes):
+                await reply_full(message, "%s\n📚 Tổng: %s lượt update."
+                                 % ("📝 Đã cập nhật YAML\n 👉🏻 Đang chạy Ansible..." if has_updates else
+                                    "🔄 YAML đã đúng\n 👉🏻 Đang chạy Ansible để đồng bộ GitLab...", len(changes)))
+            results = await backend(workflow.run_batch, changes)
+            tested = True
+            recap = "\n\n".join("$ %s\n%s" % (" ".join(result.command), result.recap) for result in results)
+            if not has_updates:
+                text = ("✅ Đã đồng bộ quyền.\n" + "\n".join(
+                    "%s/%s: %s → %s (GitLab API xác nhận)" % (
+                        item.request.namespace, item.request.service, ", ".join(item.request.usernames), item.request.role,
+                    ) for item in changes if item.mode == "sync"
+                ) if results else
+                        already_granted(changes[-1].request))
+                await reply_full(message, text + ("\n" + recap if recap else ""))
+                return
+            session.update(stage="decision", change=changes, recap=recap)
+            keep_session = True
+            await reply_full(message, "✅ Ansible thành công.\n📚 %s lượt; %s thay đổi YAML.\n%s" % (
+                len(changes), sum(change.mode == "update" for change in changes), recap,
+            ))
+            await show_final_menu(message, session)
+        except Exception as exc:
+            if has_updates:
+                keep_session = True
+                session.update(stage="decision" if tested else "failed", change=changes)
+            if not isinstance(exc, (WorkflowError, TelegramError)):
+                logging.exception("Unexpected /gitlab batch failure")
             try:
-                change = await backend(workflow.prepare, request)
-                if change.mode == "unchanged":
-                    await reply_full(
-                        message,
-                        already_granted(request),
-                    )
-                    return
-                await reply_git_report(message, change.report)
-                await reply_full(
-                    message, "%s\nansible-playbook -i nonprod %s --tags=%s,project_user_access --extra-vars=@group_vars/gitlab-bot"
-                    % ("🔄 YAML đã đúng; đang chạy Ansible để đồng bộ GitLab."
-                       if change.mode == "sync" else "📝 Đã cập nhật YAML; đang chạy Ansible.",
-                       request.playbook, request.namespace),
-                )
-                playbook_started = True
-                result = await backend(workflow.run_playbook, change)
-                if change.mode == "sync":
-                    await reply_full(
-                        message,
-                        "✅ Đã đồng bộ quyền.\n%s/%s: %s → %s (GitLab API xác nhận).\n%s"
-                        % (request.namespace, request.service, ", ".join(request.usernames), request.role, result.recap),
-                    )
-                    return
-            except GitCheckError as exc:
-                await reply_git_report(message, exc.report)
-                await reply_full(message, "❌ " + str(exc))
-                return
-            except WorkflowError as exc:
-                await reply_full(message, "❌ " + str(exc))
-                return
-            except Exception:
-                logging.exception("Unexpected /gitlab failure")
-                if change is not None and not playbook_started:
-                    await backend(workflow.rollback, change)
-                await message.reply_text("❌ Lỗi nội bộ; kiểm tra log bot.")
-                return
-            session.update(stage="decision", change=change, recap=result.recap)
-            awaiting_decision = True
-            try:
-                await reply_full(message, "✅ Ansible thành công.\n%s/%s: user %s → %s\n%s" % (request.namespace, request.service, ", ".join(request.usernames), request.role, result.recap))
-                await show_final_menu(message, session)
+                if isinstance(exc, GitCheckError):
+                    await reply_git_report(message, exc.report)
+                await reply_full(message, "❌ " + (str(exc) if isinstance(exc, WorkflowError)
+                                                  else "Lỗi xử lý phiên; kiểm tra log bot."))
+                if has_updates:
+                    await show_final_menu(message, session)
             except TelegramError:
-                logging.exception("Cannot show final menu; /gitlab can show it again")
-
+                logging.exception("Cannot report batch result; /gitlab can show the pending menu again")
         finally:
-            # The session reserves the repo while waiting, without a sleeping task.
-            if not awaiting_decision:
+            if not keep_session:
                 try:
                     await clear_session(update, ctx)
                 finally:
@@ -565,26 +574,45 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
             return CONFIRM
         answer = update.callback_query.data.rsplit(":", 1)[1]
         await update.callback_query.edit_message_reply_markup(reply_markup=None)
-        if answer == "no":
-            await clear_session(update, ctx)
-            await update.effective_message.reply_text("Đã dừng luồng.")
-        else:
+        if not session.get("active"):
             if run_lock.locked():
                 await clear_session(update, ctx)
                 await update.effective_message.reply_text("Repo đang được xử lý hoặc chờ Yes/No; thử lại sau.")
                 return ConversationHandler.END
             await run_lock.acquire()
-            session.update(active=True, stage="applying", menu_id=None, finalization=Finalization())
-            ctx.application.create_task(apply_request(update, ctx, session), update=update)
+            session.update(active=True, finalization=Finalization())
+        session.update(stage="adding", menu_id=None)
+        try:
+            change = await backend(workflow.prepare, session["request"], tuple(session["changes"]))
+            session["changes"].append(change)
+        except Exception as exc:
+            if not isinstance(exc, WorkflowError):
+                logging.exception("Cannot prepare a /gitlab request")
+            if isinstance(exc, GitCheckError):
+                await reply_git_report(update.effective_message, exc.report)
+            await reply_full(update.effective_message, "❌ " + (str(exc) if isinstance(exc, WorkflowError)
+                                                              else "Không lưu được YAML; kiểm tra log bot."))
+            session["stage"] = "collecting"
+            return await selection_error(update, ctx, session)
+        if answer == "yes":
+            await reply_git_report(update.effective_message, change.report)
+            return await show_repository_menu(update.effective_message, session)
+        session["stage"] = "applying"
+        ctx.application.create_task(apply_request(update, ctx, session), update=update)
         return ConversationHandler.END
 
     async def final_input(update, ctx):
         session = await callback_session(update, ctx)
-        if session is None or session.get("stage") != "decision":
+        if session is None or session.get("stage") not in ("decision", "failed"):
             return
         answer = update.callback_query.data.rsplit(":", 1)[1]
         if answer not in final_choices(session):
             await update.effective_message.reply_text("Lượt hiện tại chỉ cho phép thử lại lựa chọn đang xử lý.")
+            return
+        if session.get("stage") == "failed" and answer == "yes":
+            session.update(stage="applying", menu_id=None)
+            await update.callback_query.edit_message_reply_markup(reply_markup=None)
+            ctx.application.create_task(apply_request(update, ctx, session), update=update)
             return
         session.update(answer=answer, stage="finishing", menu_id=None)
         try:
@@ -610,7 +638,21 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
         if await authorized(update):
             session = get_session(update, ctx)
             if session and session.get("active"):
-                if session.get("stage") in ("decision", "review"):
+                if session.get("stage") == "collecting":
+                    try:
+                        await backend(workflow.discard_pending, tuple(session["changes"]))
+                    except Exception as exc:
+                        if not isinstance(exc, WorkflowError):
+                            logging.exception("Cannot discard pending YAML")
+                        await reply_full(update.effective_message, "❌ " + (str(exc) if isinstance(exc, WorkflowError)
+                                                                          else "Chưa phục hồi đủ YAML; kiểm tra log bot và /cancle lại."))
+                        return session.get("selection_state", REPOSITORY)
+                    count = len(session["changes"])
+                    await clear_session(update, ctx)
+                    run_lock.release()
+                    await reply_full(update.effective_message, "🛑 Đã huỷ %s lượt, phục hồi YAML; chưa chạy Ansible." % count)
+                    return ConversationHandler.END
+                if session.get("stage") in ("decision", "review", "failed"):
                     await show_pending_menu(update.effective_message, session)
                 else:
                     await update.effective_message.reply_text("Lượt hiện tại đang xử lý; vui lòng chờ.")

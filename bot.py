@@ -23,7 +23,7 @@ from runtime import prepare_repository, start_health_server
 
 BOT_COMMANDS = (
     BotCommand("gitlab", "🔐 Phân quyền repo GitLab"),
-    BotCommand("cancle", "🛑 Dừng lượt hiện tại trước khi xác nhận"),
+    BotCommand("cancle", "🛑 Huỷ các lượt đang gom trước khi chạy Ansible"),
     BotCommand("reset", "♻️ Lấy master và đồng bộ quyền namespace"),
     BotCommand("help", "❓ Hướng dẫn sử dụng bot"),
 )
@@ -143,7 +143,8 @@ def build_application(settings):
             await update.effective_message.reply_text(
                 "Dùng /gitlab để chọn ghub/non-ghub, project/service bằng nút, nhập danh sách user và chọn role chung. "
                 "Dùng /reset để chọn nhóm/namespace, lấy master và chạy lại quyền theo YAML.\n"
-                "Dùng /cancle (hoặc /cancel) để dừng trước khi xác nhận.\n"
+                "Sau mỗi lượt /gitlab: Yes thêm lượt mới; No chạy Ansible cho các lượt đã gom.\n"
+                "Dùng /cancle (hoặc /cancel) để huỷ các lượt đang gom trước Ansible.\n"
                 "Dùng /help để xem hướng dẫn.\n"
                 "Dùng /whoami để xem chat_id, user_id và quyền truy cập."
             )
