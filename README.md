@@ -71,6 +71,8 @@ Xem [Telegram HTML formatting](https://core.telegram.org/bots/api#html-style).
 
 1. `/gitlab` → chọn ghub/non-ghub → **📁 Chọn project** → **📁 Chọn service**.
    Các menu đọc danh sách từ YAML, 12 lựa chọn/trang và hai nút/hàng.
+   Namespace `qc` bị loại khỏi cả `/gitlab` và `/reset` ở cả hai nhóm;
+   backend cũng từ chối yêu cầu trực tiếp hoặc lựa chọn cũ trỏ đến `qc`.
 2. Nhập một hoặc nhiều username (dấu phẩy, khoảng trắng hoặc xuống dòng), tối đa 50 user/lượt.
    Chọn role chung: maintainer, developer, reporter hoặc guest.
 3. Bot đọc GitLab REST API, hiển thị thông tin quyền với icon và đối chiếu YAML.

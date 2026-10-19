@@ -26,6 +26,7 @@ ACCESS_FILE = "group_vars/gitlab-ghub"
 PLAYBOOK = "gitlab-repos-ghub.yaml"
 INVENTORY = "nonprod"
 REQUIRED_BRANCH = "master"
+EXCLUDED_NAMESPACES = frozenset({"qc"})
 ROLES = ("maintainer", "developer", "reporter", "guest")
 ROLE_LEVELS = {"maintainer": 40, "developer": 30, "reporter": 20, "guest": 10}
 REPOSITORIES = {
@@ -186,9 +187,15 @@ def _load(source, access_file=ACCESS_FILE):
     return text, document, nodes
 
 
-def _namespace(document, namespace):
+def _check_namespace(namespace):
     if not SLUG.fullmatch(namespace):
         raise WorkflowError("Tên namespace không hợp lệ.")
+    if namespace in EXCLUDED_NAMESPACES:
+        raise WorkflowError("Namespace %s đã bị loại khỏi /gitlab và /reset." % namespace)
+
+
+def _namespace(document, namespace):
+    _check_namespace(namespace)
     groups = document.get("gitlab_groups")
     projects = document.get("gitlab_projects")
     if not isinstance(groups, list) or not isinstance(projects, dict):
@@ -496,6 +503,7 @@ class GitLabAccessWorkflow:
         result = []
         for group in groups:
             if (isinstance(group, dict) and isinstance(group.get("path"), str)
+                    and group["path"] not in EXCLUDED_NAMESPACES
                     and group["path"] in projects):
                 namespace = group["path"]
                 _, services = _namespace(document, namespace)
@@ -509,8 +517,7 @@ class GitLabAccessWorkflow:
     def reset_namespace(self, repo_kind, namespace):
         """Apply one namespace from the freshly pulled, clean remote master."""
         repository_files(repo_kind)
-        if not SLUG.fullmatch(namespace):
-            raise WorkflowError("Tên namespace không hợp lệ.")
+        _check_namespace(namespace)
         if self.report(repo_kind).porcelain:
             raise GitCheckError("Repo còn thay đổi local; hoàn tất lượt /gitlab trước khi /reset.",
                                 self.report(repo_kind))
@@ -658,6 +665,8 @@ class GitLabAccessWorkflow:
     def run_batch(self, changes):
         """Apply the final YAML once per repo group/namespace, with selected services."""
         changes = self._changes(changes)
+        for change in changes:
+            _check_namespace(change.request.namespace)
         _, final = self._batch_files(changes)
         self._validate_pending(changes)
         self._verify_identities(changes)

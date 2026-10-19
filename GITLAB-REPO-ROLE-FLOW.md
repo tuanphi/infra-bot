@@ -6,6 +6,10 @@ gom Ansible và tạo commit; `bot.py` đăng ký BotCommand. Bot chỉ push bra
 không tạo MR, không có luồng `/run` hoặc module cấu hình riêng.
 Callback `ansible_callbacks/bot_timing.py` và quote HTML được giữ.
 
+Namespace `qc` bị loại khỏi danh sách của `/gitlab` và `/reset` cho cả ghub
+và non-ghub. Backend chặn lựa chọn cũ hoặc yêu cầu trực tiếp với `qc` trước
+khi đọc quyền qua API, sửa YAML hoặc chạy Ansible.
+
 ## Hội thoại và ý nghĩa Yes/No
 
 ```mermaid
