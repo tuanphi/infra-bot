@@ -62,7 +62,7 @@ def already_granted(request):
 
 
 def access_summary(request):
-    lines = ["🗂 Nhóm: %s\n🏠 Namespace: %s\n🧩 Service: %s\n🔗 Project: %s\n🛡 Role được chọn: %s"
+    lines = ["🗂 Nhóm: %s\n🏠 Project: %s\n🧩 Service: %s\n🔗 Link: https://gitlab.g-pay.vn/%s\n🛡 Role được chọn: %s"
              % (request.repo_kind, request.namespace, request.service, request.project_path, request.role)]
     modes = {"unchanged": "✅ đã có quyền", "sync": "🔄 cần đồng bộ GitLab", "update": "📝 cần sửa YAML"}
     for access, mode in zip(request.accesses, request.user_modes):
@@ -182,7 +182,7 @@ def create_gitlab_conversation(workflow, run_lock, authorized):
         session["selection_state"] = SERVICE
         await show_selection_menu(
             message, session, session["services"],
-            "📁 Chọn service\n🗂 Nhóm: %s\n🏠 Namespace: %s" % (session["repo_kind"], session["namespace"]),
+            "📁 Chọn service\n🗂 Nhóm: %s\n🏠 Project: %s" % (session["repo_kind"], session["namespace"]),
             "service", "servicepage", page,
         )
 

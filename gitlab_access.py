@@ -771,7 +771,7 @@ class GitLabAccessWorkflow:
             detail = redact_git_output(_recap(output) or output[-3000:], self.settings.gitlab_token)
             raise WorkflowError("Ansible thất bại (exit %s).\n%s\n%s" % (code, detail, failure_note))
         recap = _recap(output)
-        timing = "⏱ Ansible: %.1f giây; namespace %s: %s/%s project." % (elapsed, namespace, project_count, total)
+        timing = "⏱ Ansible: %.1f giây; project %s: %s/%s services." % (elapsed, namespace, project_count, total)
         if service is not None:
             timing += " Service: " + (service if isinstance(service, str) else ", ".join(service))
         slow_tasks = []
